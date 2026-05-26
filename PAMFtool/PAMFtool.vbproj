@@ -1,0 +1,12 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>PAMFtool</RootNamespace>
+    <TargetFramework>net8.0</TargetFramework>
+	<RollForward>Major</RollForward>
+	<Company>ravenDS</Company>
+	<Authors>ravenDS</Authors>
+  </PropertyGroup>
+
+</Project>
