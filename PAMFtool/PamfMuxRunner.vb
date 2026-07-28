@@ -299,12 +299,27 @@ Friend Module PamfMuxRunner
         Return 3   ' default 29.97
     End Function
 
-    ' MPEG-2 Video: parse sequence_header, slice at picture boundaries
+    ' MPEG-2 Video: parse sequence_header, slice at picture boundaries.
+    ' stream the input file for >2 GB M2V sources
+    '   pass 1: scan sequentially, picture_start_code offset (Int64), sequence_header offset (for RAP marking), and vbv_delay
+    '   pass 2: seek to each picture, read into per-picture Byte(), queue as AccessUnit
 
     Private Sub RegisterAndQueueM2v(mux As PamfMuxer, f As MuxInput)
-        Dim bytes As Byte() = File.ReadAllBytes(f.Path)
+        ' 1) peek at file head to parse the first sequence_header
+        Dim fi As New FileInfo(f.Path)
+        Dim fileLen As Long = fi.Length
+        Dim peekLen As Integer = CInt(Math.Min(CLng(1024 * 1024), fileLen))
+        Dim peek(peekLen - 1) As Byte
+        Using pfs As FileStream = File.OpenRead(f.Path)
+            Dim total As Integer = 0
+            While total < peekLen
+                Dim n As Integer = pfs.Read(peek, total, peekLen - total)
+                If n <= 0 Then Exit While
+                total += n
+            End While
+        End Using
         Dim seq As M2vSequenceInfo = MpegSequenceHeaderParser.ParseFirstSequenceHeader(
-            bytes, 0, bytes.Length)
+            peek, 0, peek.Length)
         If seq Is Nothing Then
             Throw New InvalidDataException("Could not parse sequence_header from " & f.Path)
         End If
@@ -325,51 +340,129 @@ Friend Module PamfMuxRunner
             transferChars:=transferCh,
             matrixCoeffs:=matrixCoeff)
 
-        ' split at picture_start_code (0x00000100) boundaries
-        Dim picStarts As List(Of Integer) = FindStartCodes(bytes, &H0)
-        If picStarts.Count = 0 Then
-            ' whole file as one AU
+        Dim tickPerFrame As Long = CLng(90000.0 / fps)
+        Dim ptsBase As Long = 90000L
+
+        ' 2) pass 1: scan the whole file for start codes
+        Dim picOffs As New List(Of Long)()      ' file offset of each picture_start_code
+        Dim picIsRap As New List(Of Boolean)()  ' whether a sequence_header preceded that picture
+        Dim picVbvs As New List(Of UShort)()    ' vbv_delay parsed from picture_header
+        Dim seqHdrPendingRap As Boolean = False
+        Const ScanBufSize As Integer = 1024 * 1024
+
+        Using fs As FileStream = File.OpenRead(f.Path)
+            Const Overlap As Integer = 7
+            Dim buf(ScanBufSize + Overlap - 1) As Byte
+            Dim carry As Integer = 0
+            Dim baseOff As Long = 0     ' file offset that buf[0] represents
+            Dim atEof As Boolean = False
+
+            Do
+                Dim toRead As Integer = buf.Length - carry
+                Dim n As Integer = fs.Read(buf, carry, toRead)
+                If n = 0 Then atEof = True
+                Dim totalInBuf As Integer = carry + n
+
+                ' end of scan region: leave `Overlap` bytes at the tail unless this
+                ' is the very last chunk, in which case scan all the way to the end
+                Dim scanEnd As Integer = If(atEof, totalInBuf - 3, totalInBuf - Overlap)
+                Dim i As Integer = 0
+                While i < scanEnd
+                    If buf(i) = 0 AndAlso buf(i + 1) = 0 AndAlso buf(i + 2) = 1 Then
+                        Dim sc As Byte = buf(i + 3)
+                        If sc = 0 Then
+                            picOffs.Add(baseOff + i)
+                            picIsRap.Add(seqHdrPendingRap)
+                            seqHdrPendingRap = False
+                            ' vbv_delay lives in the picture_header bytes at (start_code)+4..+7:
+                            '   byte 5 (relative) = temporal_reference[1:0] | picture_coding_type[2:0] | vbv_delay[15:13]
+                            '   byte 6 (relative) = vbv_delay[12:5]
+                            '   byte 7 (relative) = vbv_delay[4:0] | ...
+                            Dim vbv As UShort = 0
+                            If i + 7 < totalInBuf Then
+                                Dim b1 As Integer = buf(i + 5)
+                                Dim b2 As Integer = buf(i + 6)
+                                Dim b3 As Integer = buf(i + 7)
+                                vbv = CUShort(((b1 And &H7) << 13) Or (b2 << 5) Or (b3 >> 3))
+                            End If
+                            picVbvs.Add(vbv)
+                            i += 4
+                            Continue While
+                        ElseIf sc = &HB3 Then
+                            seqHdrPendingRap = True
+                            i += 4
+                            Continue While
+                        End If
+                    End If
+                    i += 1
+                End While
+
+                ' carry the last (totalInBuf - i) bytes to the front for the next read
+                If atEof Then
+                    Exit Do
+                End If
+                Dim remaining As Integer = totalInBuf - i
+                If remaining > 0 Then
+                    Array.Copy(buf, i, buf, 0, remaining)
+                End If
+                baseOff += i
+                carry = remaining
+            Loop
+        End Using
+
+        ' 3) pass 2: read each picture bytes and queue as an AU
+        If picOffs.Count = 0 Then
+            If fileLen > Int32.MaxValue Then
+                Throw New InvalidDataException(
+                    "No picture_start_code found and file exceeds 2 GiB - can't queue as one AU: " & f.Path)
+            End If
+            Dim au(CInt(fileLen) - 1) As Byte
+            Using fs As FileStream = File.OpenRead(f.Path)
+                Dim total As Integer = 0
+                While total < au.Length
+                    Dim n As Integer = fs.Read(au, total, au.Length - total)
+                    If n <= 0 Then Exit While
+                    total += n
+                End While
+            End Using
             mux.QueueAu(ps, New AccessUnit() With {
-                .Data = bytes, .Pts = 90000L, .Dts = 90000L,
+                .Data = au, .Pts = 90000L, .Dts = 90000L,
                 .IsRandomAccessPoint = True
             })
             Return
         End If
 
-        Dim tickPerFrame As Long = CLng(90000.0 / fps)
-        Dim ptsBase As Long = 90000L
-        For i As Integer = 0 To picStarts.Count - 1
-            Dim s As Integer = picStarts(i)
-            ' first AU also includes any sequence/GOP headers preceding it
-            If i = 0 AndAlso s > 0 Then s = 0
-            Dim e As Integer = If(i + 1 < picStarts.Count, picStarts(i + 1), bytes.Length)
-            Dim au(e - s - 1) As Byte
-            Array.Copy(bytes, s, au, 0, e - s)
-            Dim pts As Long = ptsBase + CLng(i) * tickPerFrame
-            ' RAP if this AU starts with sequence_header (0x000001B3)
-            Dim isRap As Boolean = au.Length >= 4 AndAlso
-                au(0) = 0 AndAlso au(1) = 0 AndAlso au(2) = 1 AndAlso au(3) = &HB3
-            ' pull vbv_delay from the picture header at picStarts(i). picStarts(i) points
-            ' at the 00 00 01 00 start code, so the 3 bytes at +5..+7 carry
-            '   b1 = temporal_reference[1:0] | picture_coding_type[2:0] | vbv_delay[15:13]
-            '   b2 = vbv_delay[12:5]
-            '   b3 = vbv_delay[4:0] | ...
-            ' this feeds Sony's per-picture private_stream_2 directory tag on the mux side
-            Dim ph As Integer = picStarts(i)
-            Dim vbv As UShort = 0
-            If ph + 7 < bytes.Length Then
-                Dim b1 As Integer = bytes(ph + 5)
-                Dim b2 As Integer = bytes(ph + 6)
-                Dim b3 As Integer = bytes(ph + 7)
-                vbv = CUShort(((b1 And &H7) << 13) Or (b2 << 5) Or (b3 >> 3))
-            End If
-            mux.QueueAu(ps, New AccessUnit() With {
-                .Data = au, .Pts = pts, .Dts = pts,
-                .IsRandomAccessPoint = isRap,
-                .VideoPictureIndex = i,
-                .VideoVbvDelay = vbv
-            })
-        Next
+        Using fs As FileStream = File.OpenRead(f.Path)
+            For i As Integer = 0 To picOffs.Count - 1
+                Dim startOff As Long = If(i = 0, 0L, picOffs(i))   ' first AU includes preamble
+                Dim endOff As Long = If(i + 1 < picOffs.Count, picOffs(i + 1), fileLen)
+                Dim sz As Long = endOff - startOff
+                If sz <= 0 Then Continue For
+                If sz > Int32.MaxValue Then
+                    Throw New InvalidDataException(
+                        "Picture " & i & " byte range exceeds 2 GiB (" & sz & " bytes); refusing to allocate.")
+                End If
+                Dim au(CInt(sz) - 1) As Byte
+                fs.Position = startOff
+                Dim total As Integer = 0
+                While total < au.Length
+                    Dim n As Integer = fs.Read(au, total, au.Length - total)
+                    If n <= 0 Then Exit While
+                    total += n
+                End While
+
+                Dim pts As Long = ptsBase + CLng(i) * tickPerFrame
+                ' RAP if this AU starts with sequence_header (0x000001B3)
+                Dim isRap As Boolean = picIsRap(i) OrElse (au.Length >= 4 AndAlso
+                    au(0) = 0 AndAlso au(1) = 0 AndAlso au(2) = 1 AndAlso au(3) = &HB3)
+                mux.QueueAu(ps, New AccessUnit() With {
+                    .Data = au, .Pts = pts, .Dts = pts,
+                    .IsRandomAccessPoint = isRap,
+                    .VideoPictureIndex = i,
+                    .VideoVbvDelay = picVbvs(i)
+                })
+            Next
+        End Using
     End Sub
 
     Private Function FindStartCodes(bytes As Byte(), codeByte As Byte) As List(Of Integer)

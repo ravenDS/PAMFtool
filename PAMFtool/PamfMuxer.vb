@@ -117,34 +117,55 @@ Namespace PamfMux
         End Sub
 
         Public Sub WritePamfFile(output As Stream)
-            Using payloadBuf As New MemoryStream()
-                PsMuxer.WritePackedStream(payloadBuf)
-                Dim psBytes As Long = payloadBuf.Length
+            If Not output.CanSeek Then
+                Throw New InvalidOperationException(
+                    "PAMF output stream must be seekable (Mpeg2PsMuxer patches the header and the private_stream_2 directory tags in place).")
+            End If
 
-                ' pad to sector boundary if not already there
-                If psBytes Mod Mpeg2PsPrimitives.SectorSize <> 0 Then
-                    Throw New InvalidOperationException(
-                        "PS payload not sector-aligned; muxer bug. Got " & psBytes)
-                End If
+            Dim headerStart As Long = output.Position
 
-                Dim numPacks As Integer = CInt(psBytes \ Mpeg2PsPrimitives.SectorSize)
+            Dim placeholder(Mpeg2PsPrimitives.SectorSize - 1) As Byte
+            output.Write(placeholder, 0, placeholder.Length)
 
-                ' copy EP entries from each video stream into the header
-                If Not SkipEpTable Then
-                    For Each s In PsMuxer.Streams
-                        For Each e In s.EpEntries
-                            HeaderWriter.AddEpEntry(e.Pts, e.ByteOffset)
-                        Next
+            Dim psStart As Long = output.Position
+            PsMuxer.WritePackedStream(output)
+            Dim psBytes As Long = output.Position - psStart
+
+            If psBytes Mod Mpeg2PsPrimitives.SectorSize <> 0 Then
+                Throw New InvalidOperationException(
+                    "PS payload not sector-aligned; muxer bug. Got " & psBytes)
+            End If
+
+            Dim numPacks As Long = psBytes \ Mpeg2PsPrimitives.SectorSize
+            If numPacks > UInteger.MaxValue Then
+                Throw New InvalidOperationException(
+                    "PAMF numPacks exceeds 32-bit range (" & numPacks & "); header field would overflow.")
+            End If
+
+            ' copy EP entries from each video stream into the header
+            If Not SkipEpTable Then
+                For Each s In PsMuxer.Streams
+                    For Each e In s.EpEntries
+                        HeaderWriter.AddEpEntry(e.Pts, e.ByteOffset)
                     Next
-                End If
+                Next
+            End If
 
-                ' translate MuxRateBps -> PAMF header mux_rate field. same units as MPEG-2 PS pack header mux_rate (50 bytes/sec per unit)
-                Dim muxRateUnits As Integer = CInt(CLng(PsMuxer.MuxRateBps) \ 8L \ 50L)
+            ' translate MuxRateBps -> PAMF header mux_rate field. same units as MPEG-2 PS pack header mux_rate (50 bytes/sec per unit)
+            Dim muxRateUnits As Integer = CInt(CLng(PsMuxer.MuxRateBps) \ 8L \ 50L)
 
-                Dim hdr As Byte() = HeaderWriter.Build(numPacks, TotalDuration90, muxRateUnits)
-                output.Write(hdr, 0, hdr.Length)
-                payloadBuf.WriteTo(output)
-            End Using
+            Dim hdr As Byte() = HeaderWriter.Build(CInt(numPacks), TotalDuration90, muxRateUnits)
+            If hdr.Length > Mpeg2PsPrimitives.SectorSize Then
+                Throw New InvalidOperationException(
+                    "PAMF header (" & hdr.Length & " bytes) exceeds the reserved sector at file start.")
+            End If
+
+            Dim endPos As Long = output.Position
+            output.Position = headerStart
+            output.Write(hdr, 0, hdr.Length)
+            ' If the header we built happens to be smaller than the reserved sector,
+            ' the tail is already zero from the placeholder write.
+            output.Position = endPos
         End Sub
 
     End Class
