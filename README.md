@@ -27,4 +27,5 @@ Supported streams:
 
 ## Notes
 - While the demuxer is fully functional, the muxer is still experimental. `PAMF` files rebuilt with this tool work in all tested PS3 games so far.
+- > 2GB files can't be remuxed yet
 - Raw H.264 data does not play in most video players. Use **ffmpeg** to mux it back into a more conventional container format.
