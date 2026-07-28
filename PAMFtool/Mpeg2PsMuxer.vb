@@ -54,9 +54,7 @@ Namespace PamfMux
     Public Class Mpeg2PsMuxer
 
         Public Const PtsClockHz As Long = 90000L
-        ' PAMF encode start both video and audio at PTS = 90000 and place the first video picture in sector 0 (observed, might differ in some files)
-        ' to reproduce that ordering, don't schedule audio ahead of vido, let PickNextStream pick video first
-        Public Const AudioLeadTicks As Long = 0L
+        Public Const AudioLeadTicks As Long = 9000L
         Public Const InitialScr As Long = 30030L
 
         ' Sony PAMF encodes use mux_rate bound of 48 Mbps (0x1D4C0 in the header)
@@ -150,7 +148,10 @@ Namespace PamfMux
             Dim muxRateUnits As Integer = MuxRateBps \ 8 \ 50
             _ps2Offsets.Clear()
 
-            ' no dedicated "initial pack" here
+            If Not HasMpeg2VideoStream() Then
+                Dim initialVideoPstd As Integer = FirstVideoPstd()
+                EmitInitialPack(output, scr, muxRateUnits, initialVideoPstd)
+            End If
 
             While HasMoreData()
                 Dim s As PamfMuxStream = PickNextStream()
@@ -161,18 +162,21 @@ Namespace PamfMux
 
                 Dim spaceLeft As Integer = SectorSize - PackHeaderLen
 
-                ' at every video AU boundary (first chunk of an AU, i.e. picture start),
-                ' emit system_header + private_stream_2 with 22-byte descriptor
-                ' hardware uses this to find picture boundaries 
                 If s.IsVideo AndAlso s.AuQueue.Count > 0 AndAlso
                    Not _splitState.ContainsKey(s.Index) Then
                     Dim head As AccessUnit = s.AuQueue.Peek()
-                    WriteSystemHeader(output, muxRateUnits, s.PstdBufferSize)
-                    Dim ps2Off As Long = output.Position
-                    WriteSonyPictureMarker(output, s.PesStreamId,
-                                           head.VideoPictureIndex = 0, head.VideoVbvDelay)
-                    _ps2Offsets.Add(ps2Off)
-                    spaceLeft = SectorSize - CInt(output.Position - packStart)
+                    If s.Codec = PamfStreamType.MPEG2Video Then
+                        WriteSystemHeader(output, muxRateUnits, s.PstdBufferSize)
+                        Dim ps2Off As Long = output.Position
+                        WriteSonyPictureMarker(output, s.PesStreamId,
+                                               head.VideoPictureIndex = 0, head.VideoVbvDelay)
+                        _ps2Offsets.Add(ps2Off)
+                        spaceLeft = SectorSize - CInt(output.Position - packStart)
+                    ElseIf head.IsRandomAccessPoint Then
+                        WriteSystemHeader(output, muxRateUnits, s.PstdBufferSize)
+                        WriteRapMarker(output, s.PesStreamId)
+                        spaceLeft = SectorSize - CInt(output.Position - packStart)
+                    End If
                 End If
 
                 EmitOnePesIntoSector(output, s, spaceLeft, packStart)
@@ -213,6 +217,53 @@ Namespace PamfMux
                 output.Position = endPos
             End If
         End Sub
+
+        ' Restored from the previously-shipping muxer for AVC compatibility: at each
+        ' video RAP we emit a system_header followed by a small 4-byte private_stream_2
+        ' payload that identifies the video stream. The tool's own demuxer doesn't
+        ' parse this today; it's here because Sony PAMF hardware expects it (removing
+        ' it entirely produced files the PS3 refused to play back).
+        Private Sub WriteRapMarker(out As Stream, videoStreamId As Byte)
+            out.WriteByte(0) : out.WriteByte(0) : out.WriteByte(1)
+            out.WriteByte(SC_PrivateStream2)
+            out.WriteByte(0) : out.WriteByte(4)             ' PES length = 4
+            out.WriteByte(0)                                ' payload byte 0
+            out.WriteByte(videoStreamId)                    ' payload byte 1 = stream id
+            out.WriteByte(&HFF) : out.WriteByte(&HFF)       ' payload bytes 2-3
+        End Sub
+
+        Private Sub EmitInitialPack(out As Stream, scr As Long, muxRateUnits As Integer,
+                                    videoPstdBufferSize As Integer)
+            Dim packStart As Long = out.Position
+            WritePackHeader(out, scr, 0, muxRateUnits)
+            WriteSystemHeader(out, muxRateUnits, videoPstdBufferSize)
+            Dim used As Integer = CInt(out.Position - packStart)
+            Dim remaining As Integer = SectorSize - used
+            If remaining >= 7 Then
+                WritePaddingStream(out, remaining)
+            ElseIf remaining > 0 Then
+                For i As Integer = 0 To remaining - 1
+                    out.WriteByte(&H0)
+                Next
+            End If
+        End Sub
+
+        ' Look up the first video stream's per-stream P-STD buffer size, for the
+        ' system_header that goes into sector 0's initial pack. Falls back to 1505
+        ' (the old AVC-oriented default) if we can't find a video stream.
+        Private Function FirstVideoPstd() As Integer
+            For Each s In Streams
+                If s.IsVideo Then Return s.PstdBufferSize
+            Next
+            Return 1505
+        End Function
+
+        Private Function HasMpeg2VideoStream() As Boolean
+            For Each s In Streams
+                If s.Codec = PamfStreamType.MPEG2Video Then Return True
+            Next
+            Return False
+        End Function
 
         ' Sony private_stream_2 (0xBF) tag
         ' layout (22 bytes):
@@ -269,7 +320,10 @@ Namespace PamfMux
                 If s.AuQueue.Count = 0 Then Continue For
                 Dim head As AccessUnit = s.AuQueue.Peek()
                 Dim key As Long = head.Pts
-                If s.IsAudio Then key -= AudioLeadTicks
+                ' only compressed audio (AT3+/AC-3) needs the pre-buffer lead
+                If s.IsAudio AndAlso s.Codec <> PamfStreamType.LPCM Then
+                    key -= AudioLeadTicks
+                End If
                 If key < bestKey Then
                     bestKey = key
                     best = s
