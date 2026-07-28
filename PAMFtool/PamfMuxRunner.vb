@@ -349,9 +349,25 @@ Friend Module PamfMuxRunner
             ' RAP if this AU starts with sequence_header (0x000001B3)
             Dim isRap As Boolean = au.Length >= 4 AndAlso
                 au(0) = 0 AndAlso au(1) = 0 AndAlso au(2) = 1 AndAlso au(3) = &HB3
+            ' pull vbv_delay from the picture header at picStarts(i). picStarts(i) points
+            ' at the 00 00 01 00 start code, so the 3 bytes at +5..+7 carry
+            '   b1 = temporal_reference[1:0] | picture_coding_type[2:0] | vbv_delay[15:13]
+            '   b2 = vbv_delay[12:5]
+            '   b3 = vbv_delay[4:0] | ...
+            ' this feeds Sony's per-picture private_stream_2 directory tag on the mux side
+            Dim ph As Integer = picStarts(i)
+            Dim vbv As UShort = 0
+            If ph + 7 < bytes.Length Then
+                Dim b1 As Integer = bytes(ph + 5)
+                Dim b2 As Integer = bytes(ph + 6)
+                Dim b3 As Integer = bytes(ph + 7)
+                vbv = CUShort(((b1 And &H7) << 13) Or (b2 << 5) Or (b3 >> 3))
+            End If
             mux.QueueAu(ps, New AccessUnit() With {
                 .Data = au, .Pts = pts, .Dts = pts,
-                .IsRandomAccessPoint = isRap
+                .IsRandomAccessPoint = isRap,
+                .VideoPictureIndex = i,
+                .VideoVbvDelay = vbv
             })
         Next
     End Sub
@@ -539,33 +555,53 @@ Friend Module PamfMuxRunner
             sampleRate:=sampleRate, numChannels:=CByte(channels),
             bitsPerSample:=bitsPerSample)
 
-        ' slice into 20 ms AUs (= sampleRate/50 samples per AU)
+        ' PAMF LPCM AU is one 5 ms audio frame, 240 samples at 48 kHz
+        ' au_size = sample_rate * bits_per_sample / 8 * padded_channels / 200
+        '
+        ' where padded_channels = channels + (channels & 1).
+        '
         Dim bps As Integer = bitsPerSample \ 8
-        Dim samplesPerAu As Integer = sampleRate \ 50
-        Dim auBytes As Integer = samplesPerAu * channels * bps
+        Dim paddedChannels As Integer = channels + (channels And 1)
+        Dim samplesPerAu As Integer = sampleRate \ 200
+        Dim wavStride As Integer = channels * bps         ' bytes per sample-time in the input WAV
+        Dim wireStride As Integer = paddedChannels * bps  ' bytes per sample-time on the PAMF wire
+        Dim auBytes As Integer = samplesPerAu * wireStride
         Dim ptsStep As Long = CLng(samplesPerAu * 90000L \ CLng(sampleRate))
         Dim ptsBase As Long = 90000L
         Dim auIndex As Integer = 0
         Dim p As Integer = dataOff
         Dim [end] As Integer = dataOff + dataLen
+
         While p < [end]
-            Dim chunkLen As Integer = Math.Min(auBytes, [end] - p)
-            Dim au(chunkLen - 1) As Byte
-            ' swap LE -> BE per sample
-            Dim i As Integer = 0
-            While i < chunkLen
-                For b As Integer = bps - 1 To 0 Step -1
-                    au(i + (bps - 1 - b)) = data(p + i + b)
+            ' emit at most `samplesPerAu`, final AU may be shorter if WAV doesn't end on an AU boundary
+            Dim wavRemain As Integer = [end] - p
+            Dim samplesInAu As Integer = Math.Min(samplesPerAu, wavRemain \ wavStride)
+            If samplesInAu <= 0 Then Exit While   ' partial trailing sample: drop
+
+            Dim wireBytes As Integer = samplesInAu * wireStride
+            Dim au(wireBytes - 1) As Byte
+            Dim src As Integer = p
+            Dim dst As Integer = 0
+            For n As Integer = 0 To samplesInAu - 1
+                ' real channels: byte-swap each channel sample WAV LE -> wire BE
+                For ch As Integer = 0 To channels - 1
+                    For b As Integer = 0 To bps - 1
+                        au(dst + b) = data(src + bps - 1 - b)
+                    Next
+                    src += bps
+                    dst += bps
                 Next
-                i += bps
-            End While
+                ' padded silence channel: array is already zero-initialised, just advance dst
+                dst += (paddedChannels - channels) * bps
+            Next
+            p += samplesInAu * wavStride
+
             mux.QueueAu(ps, New AccessUnit() With {
                 .Data = au,
                 .Pts = ptsBase + CLng(auIndex) * ptsStep,
                 .Dts = ptsBase + CLng(auIndex) * ptsStep,
                 .IsRandomAccessPoint = False
             })
-            p += chunkLen
             auIndex += 1
         End While
     End Sub

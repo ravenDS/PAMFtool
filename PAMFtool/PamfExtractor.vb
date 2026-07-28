@@ -302,10 +302,23 @@ Public Class PamfFile
 
     Private Const SectorSize As Integer = 2048
 
+    Private Const HeaderScanCap As Integer = 8 * 1024 * 1024
+
     Public Sub Open(path As String)
         FilePath = path
-        Dim raw As Byte() = File.ReadAllBytes(path)
-        FileSize = raw.LongLength
+        Dim fi As New FileInfo(path)
+        FileSize = fi.Length
+
+        Dim rawSize As Integer = CInt(Math.Min(CLng(HeaderScanCap), FileSize))
+        Dim raw(rawSize - 1) As Byte
+        Using fs As FileStream = File.OpenRead(path)
+            Dim total As Integer = 0
+            While total < rawSize
+                Dim n As Integer = fs.Read(raw, total, rawSize - total)
+                If n <= 0 Then Exit While
+                total += n
+            End While
+        End Using
 
         ' magic + version
         If raw.Length < SectorSize OrElse
@@ -547,12 +560,19 @@ Public Class PamfFile
                     s.SampleRate = If(fsCode = 1, 48000, 0)
 
                 Case PamfStreamType.LPCM
-                    ' LPCM adds bps at ci(4): 1=16-bit, 3=24-bit
+                    ' LPCM bit-depth is a coded byte at ci(4)
+                    '   0x01 / 0x40 => 16-bit
+                    '   0x03 / 0x50 => 24-bit  (0x50 inferred, unverified)
+                    ' anything else -> 0 = unknown (WriteWavHeader falls back to 16)
                     s.NumChannels = raw(ci + 2)
                     Dim fsCode As Integer = raw(ci + 3)
                     s.SampleRate = If(fsCode = 1, 48000, 0)
                     Dim bpsCode As Integer = raw(ci + 4)
-                    s.BitsPerSample = If(bpsCode = 3, 24, If(bpsCode = 1, 16, 0))
+                    Select Case bpsCode
+                        Case &H1, &H40 : s.BitsPerSample = 16
+                        Case &H3, &H50 : s.BitsPerSample = 24
+                        Case Else : s.BitsPerSample = 0
+                    End Select
             End Select
 
             Streams.Add(s)
@@ -650,7 +670,12 @@ Public Class PamfFile
                     lpcmStreams(s.Index) = s
                     lpcmCounts(s.Index) = 0
                     Dim bps As Integer = If(s.BitsPerSample > 0, CInt(s.BitsPerSample), 16)
-                    lpcmSwappers(s.Index) = New LpcmBeToLeSwapper(bw, bps \ 8)
+                    ' mono LPCM padded with a dummy 2nd channel on the wire
+                    Dim actualCh As Integer = Math.Max(1, CInt(s.NumChannels))
+                    Dim wireCh As Integer = actualCh + (actualCh And 1)
+                    lpcmSwappers(s.Index) = New LpcmBeToLeSwapper(bw, bps \ 8,
+                                                                  channelsOnWire:=wireCh,
+                                                                  channelsToWrite:=actualCh)
                 ElseIf s.StreamType = PamfStreamType.ATRAC3plus Then
                     ' Reserve room for RIFF AT3+ header, filled when frame count is known
                     ' WriteAt3RiffHeader writes exactly Atrac3PlusAuStripper.At3RiffHeaderLen bytes
@@ -960,8 +985,9 @@ Public Class PamfFile
             Dim key As Integer = (CInt(sid) << 8) Or subId
             Dim s As PamfStreamInfo = Nothing
             If audioByKey.TryGetValue(key, s) AndAlso writers.ContainsKey(s.Index) Then
+                ' 4-byte audio sub-header, then ES data. This is the layout for
+                ' Sony's real PS3 PAMFs put PCM samples directly after the sub-header, without any per-frame aux buf
                 Dim subHdr As Integer = 4
-                If s.StreamType = PamfStreamType.LPCM Then subHdr = 4 ' aux header is part of the 4 bytes already
                 Dim esOff As Integer = payOff + subHdr
                 Dim esLen As Integer = payEnd - esOff
                 If esLen > 0 Then
@@ -970,9 +996,12 @@ Public Class PamfFile
                     If at3Strippers IsNot Nothing AndAlso at3Strippers.ContainsKey(s.Index) Then
                         at3Strippers(s.Index).Append(buf, esOff, esLen)
                     ElseIf lpcmSwappers IsNot Nothing AndAlso lpcmSwappers.ContainsKey(s.Index) Then
-                        ' PAMF LPCM samples are big-endian, may straddle PES boundaries
-                        lpcmSwappers(s.Index).Append(buf, esOff, esLen)
-                        lpcmCounts(s.Index) += esLen   ' (1:1 byte ratio)
+                        ' PAMF LPCM samples are big-endian, may straddle PES boundaries.
+                        ' for mono streams, the swapper drops the dummy silence channel
+                        Dim sw As LpcmBeToLeSwapper = lpcmSwappers(s.Index)
+                        Dim before As Long = sw.BytesWritten
+                        sw.Append(buf, esOff, esLen)
+                        lpcmCounts(s.Index) += sw.BytesWritten - before
                     Else
                         writers(s.Index).Write(buf, esOff, esLen)
                         If lpcmCounts.ContainsKey(s.Index) Then
@@ -1148,21 +1177,45 @@ End Class
 '
 ' PAMF LPCM samples are big-endian
 ' standard WAV expects little-endian, samples can be 16-bit or 24-bit and a single sample may straddle a PES boundary
+'
+' mono streams are stored as two channels (mono + silent dummy channel)
 Friend Class LpcmBeToLeSwapper
 
     Private ReadOnly _bw As BinaryWriter
-    Private ReadOnly _bytesPerSample As Integer
+    Private ReadOnly _bytesPerSample As Integer   ' bytes for one channel sample (2 = 16-bit, 3 = 24-bit)
+    Private ReadOnly _channelsOnWire As Integer   ' channels present in the PAMF (padded to even for mono)
+    Private ReadOnly _channelsToWrite As Integer  ' channels the WAV output should carry (unpadded)
     Private ReadOnly _sample As Byte()
     Private _filled As Integer = 0
+    Private _channelIdx As Integer = 0            ' which channel of the current sample-time is currently being filled
+    Private _bytesWritten As Long = 0
 
+    ' total bytes emitted to WAV so far, differs from input length when channelsOnWire > channelsToWrite (mono padding)
+    Public ReadOnly Property BytesWritten As Long
+        Get
+            Return _bytesWritten
+        End Get
+    End Property
+
+    ' overload for existing call sites, assumes no padding
     Public Sub New(bw As BinaryWriter, bytesPerSample As Integer)
+        Me.New(bw, bytesPerSample, channelsOnWire:=1, channelsToWrite:=1)
+    End Sub
+
+    Public Sub New(bw As BinaryWriter, bytesPerSample As Integer,
+                   channelsOnWire As Integer, channelsToWrite As Integer)
         If bytesPerSample <> 2 AndAlso bytesPerSample <> 3 Then
             Throw New ArgumentException(
                 $"Unsupported LPCM sample size: {bytesPerSample} bytes/sample. " &
                 "PAMF LPCM is 16-bit or 24-bit.")
         End If
+        If channelsOnWire < channelsToWrite Then
+            Throw New ArgumentException("channelsOnWire must be >= channelsToWrite")
+        End If
         _bw = bw
         _bytesPerSample = bytesPerSample
+        _channelsOnWire = channelsOnWire
+        _channelsToWrite = channelsToWrite
         _sample = New Byte(bytesPerSample - 1) {}
     End Sub
 
@@ -1177,11 +1230,17 @@ Friend Class LpcmBeToLeSwapper
             p += take
             remain -= take
             If _filled = _bytesPerSample Then
-                ' write sample in reverse byte order: 16-bit: 2 bytes, 24-bit: 3 bytes
-                For i As Integer = _bytesPerSample - 1 To 0 Step -1
-                    _bw.Write(_sample(i))
-                Next
+                ' one channel sample assembled.
+                ' emit if its a "real" channel, skip it if its a dummy channel
+                If _channelIdx < _channelsToWrite Then
+                    For i As Integer = _bytesPerSample - 1 To 0 Step -1
+                        _bw.Write(_sample(i))
+                    Next
+                    _bytesWritten += _bytesPerSample
+                End If
                 _filled = 0
+                _channelIdx += 1
+                If _channelIdx = _channelsOnWire Then _channelIdx = 0
             End If
         End While
     End Sub

@@ -66,15 +66,18 @@ Namespace PamfMux
             Return CUShort(((scale And 1) << 13) Or (size And &H1FFF))
         End Function
 
-        ' typical P_STD values observed:
-        '   AVC 720p   : scale=1, size ~1505 = 1.5 MB buffer
-        '   M2V 720p   : scale=1, size 264..1234 (varies by encoder)
-        '   AT3+ / AC-3: scale=1, size=20 = 20 KB
+        ' typical P_STD values observed in real Sony PAMF encodes:
+        '   AVC 720p / 1080i : scale=1, size ~1505 (~1.5 MB)
+        '   M2V 720p         : scale=1, size 264..1234 depending on encoder; Sony's own is ~546
+        '   AT3+ / AC-3      : scale=1, size 20 (20 KB is plenty for ~256 kbps compressed audio)
+        '   LPCM             : scale=1, size 128 (~128 KB) — LPCM at 48 kHz stereo 16-bit is
+        '                      ~1.5 Mbps sustained, so the 20 KB generic-audio value is far undersized and can trip real-hardware P-STD enforcement.
 
         ' we use conservative defaults per codec
         Private Const PStdBufferAvc1080 As UShort = CUShort((1 << 13) Or 1505)   ' 0x25E1
-        Private Const PStdBufferM2v As UShort = CUShort((1 << 13) Or 264)        ' 0x2108
+        Private Const PStdBufferM2v As UShort = CUShort((1 << 13) Or 546)        ' 0x2222
         Private Const PStdBufferAudio As UShort = CUShort((1 << 13) Or 20)       ' 0x2014
+        Private Const PStdBufferLpcm As UShort = CUShort((1 << 13) Or 128)       ' 0x2080
 
         Public Sub AddAvcStream(channel As Byte, pesStreamId As Byte,
                                 profileIdc As Byte, levelIdc As Byte,
@@ -213,15 +216,24 @@ Namespace PamfMux
         Public Sub AddLpcmStream(channel As Byte, subStreamId As Byte,
                                  sampleRate As Integer,
                                  numChannels As Byte, bitsPerSample As Integer)
-            ' for LPCM the audio struct also carries bps at ci(4)
+            ' for LPCM the audio struct also carries a bit-depth code at ci(4).
+            ' Sony PAMF use a coded byte here, not the raw bit count:
+            '   0x40 = 16-bit  (observed in PS3 game PAMFs)
+            '   0x50 = 24-bit  (inferred from the bit-field shape)
+            Dim bpsCode As Byte
+            Select Case bitsPerSample
+                Case 16 : bpsCode = &H40
+                Case 24 : bpsCode = &H50
+                Case Else : bpsCode = CByte(bitsPerSample And &HFF)  ' fallback
+            End Select
             Dim ci(31) As Byte
             ci(2) = numChannels
             ci(3) = &H1   ' 48 kHz
-            ci(4) = CByte(bitsPerSample And &HFF)
+            ci(4) = bpsCode
             _streams.Add(New StreamEntry() With {
                 .StreamTypeByte = &H80, .Channel = channel,
                 .PesStreamId = &HBD, .SubStreamId = subStreamId,
-                .PStdBufferRaw = PStdBufferAudio,
+                .PStdBufferRaw = PStdBufferLpcm,
                 .CodecInfo = ci
             })
         End Sub

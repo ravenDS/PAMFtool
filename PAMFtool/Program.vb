@@ -1,4 +1,4 @@
-' PAMFtool 1.0 - by ravenDS
+' PAMFtool 1.1 - by ravenDS
 ' github.com/ravenDS
 
 Imports System.IO
@@ -73,7 +73,7 @@ Module Program
     End Function
 
     Private Sub PrintUsage()
-        Console.WriteLine("PAMFtool v1.0 - github.com/ravenDS/PAMFtool")
+        Console.WriteLine("PAMFtool v1.1 - github.com/ravenDS/PAMFtool")
         Console.WriteLine("PlayStation Advanced Movie Format (PAMF) Muxer/Demuxer")
         Console.WriteLine()
         Console.WriteLine("Demux:  PAMFtool [-demux] <input.pamf> [outDir] [-info]")
@@ -86,6 +86,7 @@ Module Program
         Console.WriteLine()
         Console.WriteLine("Additional parameters:")
         Console.WriteLine("  -info       Print info on PAMF file & streams.")
+        Console.WriteLine()
     End Sub
 
 End Module

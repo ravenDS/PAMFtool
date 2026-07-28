@@ -12,6 +12,9 @@ Namespace PamfMux
         Public Property Pts As Long
         Public Property Dts As Long
         Public Property IsRandomAccessPoint As Boolean
+        ' video-only metadata, populated by RegisterAndQueueM2v, used to fill private_stream_2 emitted at each AU start pack
+        Public Property VideoPictureIndex As Integer     ' 0-based, first picture in stream = 0
+        Public Property VideoVbvDelay As UShort          ' from MPEG-2 picture_header
     End Class
 
     Public Class PamfMuxStream
@@ -21,6 +24,9 @@ Namespace PamfMux
         Public Property SubStreamId As Byte
         Public Property NumChannels As Byte    ' for LPCM PES sub-header
         Public Property BitsPerSample As Byte  ' for LPCM PES sub-header
+        ' P-STD buffer size (1024-byte) declared in this stream system_header + in video/audio PES ext for this stream
+        ' set by AddXxxStream to codec usual value (AVC=1505, M2V=546, LPCM=128, AT3+/AC-3=20)
+        Public Property PstdBufferSize As Integer
         Public ReadOnly Property AuQueue As New Queue(Of AccessUnit)()
         Public Property LastQueuedPts As Long
         Public ReadOnly Property EpEntries As New List(Of EpEntry)()
@@ -48,18 +54,25 @@ Namespace PamfMux
     Public Class Mpeg2PsMuxer
 
         Public Const PtsClockHz As Long = 90000L
-        Public Const AudioLeadTicks As Long = 9000L
+        ' PAMF encode start both video and audio at PTS = 90000 and place the first video picture in sector 0 (observed, might differ in some files)
+        ' to reproduce that ordering, don't schedule audio ahead of vido, let PickNextStream pick video first
+        Public Const AudioLeadTicks As Long = 0L
         Public Const InitialScr As Long = 30030L
 
-        Public Property MuxRateBps As Integer = 24_000_000
-        ' P-STD buffer sizes (1024-byte units). These appear in system_header per-stream entries & in PAMF codec_info p_std_buffer field, so they must match!
-        ' Values for PAMF: 1505 KB for AVC video, 20 KB for audio
-        Public Property VideoPstdBufferSize As Integer = 1505
+        ' Sony PAMF encodes use mux_rate bound of 48 Mbps (0x1D4C0 in the header)
+        ' the pack_header SCR increments at this rate too, so leaving it at 24 Mbps produces SCRs half as fast as Sony for identical content
+        Public Property MuxRateBps As Integer = 48_000_000
+        ' Legacy: audio P-STD used for non-LPCM audio when a stream doesn't have its own.
+        ' Video P-STD now lives per-stream on PamfMuxStream.PstdBufferSize.
         Public Property AudioPstdBufferSize As Integer = 20
         Public ReadOnly Property Streams As New List(Of PamfMuxStream)()
         Public Property PayloadStartOffset As Long = 0
 
         Private ReadOnly _splitState As New Dictionary(Of Integer, Integer)()
+
+        ' offsets (in output stream) of every private_stream_2 tag we emit
+        ' populated in WritePackedStream, used at the end to patch each tag bytes 2-3 (sectors_to_next - 1) when the actual packing is known
+        Private ReadOnly _ps2Offsets As New List(Of Long)()
 
         ' bytes consumed of the current AU that hasn't been fully emitted (next goes into the next audio PES of the same stream)
         Private ReadOnly _audioPartial As New Dictionary(Of Integer, Integer)()
@@ -79,25 +92,37 @@ Namespace PamfMux
                 .Codec = codec
             }
             Select Case codec
-                Case PamfStreamType.AVC, PamfStreamType.MPEG2Video
+                Case PamfStreamType.AVC
                     Dim vc As Integer = 0
                     For Each x In Streams
                         If x.IsVideo Then vc += 1
                     Next
                     s.PesStreamId = CByte(&HE0 Or vc)
                     s.SubStreamId = 0
+                    s.PstdBufferSize = 1505   ' AVC 720p / 1080i
+                Case PamfStreamType.MPEG2Video
+                    Dim vc As Integer = 0
+                    For Each x In Streams
+                        If x.IsVideo Then vc += 1
+                    Next
+                    s.PesStreamId = CByte(&HE0 Or vc)
+                    s.SubStreamId = 0
+                    s.PstdBufferSize = 546    ' M2V 720p (Sony reference)
                 Case PamfStreamType.ATRAC3plus
                     Dim ch As Integer = CountStreamsOfCodec(PamfStreamType.ATRAC3plus)
                     s.PesStreamId = &HBD
                     s.SubStreamId = CByte(ch)
+                    s.PstdBufferSize = 20
                 Case PamfStreamType.AC3
                     Dim ch As Integer = CountStreamsOfCodec(PamfStreamType.AC3)
                     s.PesStreamId = &HBD
                     s.SubStreamId = CByte(&H30 Or ch)
+                    s.PstdBufferSize = 20
                 Case PamfStreamType.LPCM
                     Dim ch As Integer = CountStreamsOfCodec(PamfStreamType.LPCM)
                     s.PesStreamId = &HBD
                     s.SubStreamId = CByte(&H40 Or ch)
+                    s.PstdBufferSize = 128
                 Case Else
                     Throw New ArgumentException("Unsupported codec for muxing: " & codec.ToString())
             End Select
@@ -123,8 +148,9 @@ Namespace PamfMux
             PayloadStartOffset = output.Position
             Dim scr As Long = InitialScr
             Dim muxRateUnits As Integer = MuxRateBps \ 8 \ 50
+            _ps2Offsets.Clear()
 
-            EmitInitialPack(output, scr, muxRateUnits)
+            ' no dedicated "initial pack" here
 
             While HasMoreData()
                 Dim s As PamfMuxStream = PickNextStream()
@@ -135,17 +161,18 @@ Namespace PamfMux
 
                 Dim spaceLeft As Integer = SectorSize - PackHeaderLen
 
-                ' RAP marker: if this pack starts a video AU that is random access point, emit system_header + private_stream_2(stream_id)
-                ' so demuxer flags rap=true on that AU
-                ' private_stream_2 PES is only parsed when it appears after a system_header
+                ' at every video AU boundary (first chunk of an AU, i.e. picture start),
+                ' emit system_header + private_stream_2 with 22-byte descriptor
+                ' hardware uses this to find picture boundaries 
                 If s.IsVideo AndAlso s.AuQueue.Count > 0 AndAlso
                    Not _splitState.ContainsKey(s.Index) Then
                     Dim head As AccessUnit = s.AuQueue.Peek()
-                    If head.IsRandomAccessPoint Then
-                        WriteSystemHeader(output, muxRateUnits, VideoPstdBufferSize)
-                        WriteRapMarker(output, s.PesStreamId)
-                        spaceLeft = SectorSize - CInt(output.Position - packStart)
-                    End If
+                    WriteSystemHeader(output, muxRateUnits, s.PstdBufferSize)
+                    Dim ps2Off As Long = output.Position
+                    WriteSonyPictureMarker(output, s.PesStreamId,
+                                           head.VideoPictureIndex = 0, head.VideoVbvDelay)
+                    _ps2Offsets.Add(ps2Off)
+                    spaceLeft = SectorSize - CInt(output.Position - packStart)
                 End If
 
                 EmitOnePesIntoSector(output, s, spaceLeft, packStart)
@@ -169,33 +196,63 @@ Namespace PamfMux
                     Next
                 End If
             End If
+
+            ' patch each private_stream_2
+            If _ps2Offsets.Count > 0 Then
+                Dim endPos As Long = output.Position
+                For i As Integer = 0 To _ps2Offsets.Count - 1
+                    Dim curOff As Long = _ps2Offsets(i)
+                    Dim nextOff As Long = If(i + 1 < _ps2Offsets.Count,
+                                             _ps2Offsets(i + 1), endPos)
+                    Dim gapSectors As Long = (nextOff - curOff) \ SectorSize
+                    Dim val As Integer = CInt(Math.Max(0L, Math.Min(gapSectors - 1L, &HFFFFL)))
+                    output.Position = curOff + 8   ' skip 4 SC + 2 length + 2 (payload[0..1])
+                    output.WriteByte(CByte((val >> 8) And &HFF))
+                    output.WriteByte(CByte(val And &HFF))
+                Next
+                output.Position = endPos
+            End If
         End Sub
 
-        ' private_stream_2 (0xBF) PES whose payload first 2 bytes are a video stream identifier
-        ' the byte AT payload offset 1 carries the actual stream_id like 0xE0
-        Private Sub WriteRapMarker(out As Stream, videoStreamId As Byte)
-            ' PES header: 00 00 01 BF + length(2) + payload(4)
+        ' Sony private_stream_2 (0xBF) tag
+        ' layout (22 bytes):
+        '   [0]      0x01                              record marker
+        '   [1]      video_stream_id (0xE0 typically)  which video stream this tag is for
+        '   [2..3]   sectors_to_next_ps2 - 1           patched by WritePackedStream after mux
+        '   [4..9]   FF FF FF FF FF FF                 reserved
+        '   [10..13] 00 00 00 00                       reserved (possibly prev-tag offset)
+        '   [14..15] 00 06                             const (unknown Sony field)
+        '   [16..17] 00 01                             const (unknown Sony field)
+        '   [18..19] 0x2002 for the first picture in the stream, 0x2001 otherwise
+        '            (sequence-start marker vs regular picture)
+        '   [20..21] vbv_delay from the MPEG-2 picture_header (best-effort; Sony's
+        '            observed values are ~2.75x larger than the raw picture-header
+        '            field, suggesting a mux-buffer-model derived value we don't
+        '            reproduce exactly, but the relative variation between pictures
+        '            matches so hardware treats it the same way)
+        Private Sub WriteSonyPictureMarker(out As Stream,
+                                           videoStreamId As Byte,
+                                           isFirstPicture As Boolean,
+                                           vbvDelay As UShort)
+            ' 4-byte start code + 2-byte length + 22-byte payload = 28 bytes total
             out.WriteByte(0) : out.WriteByte(0) : out.WriteByte(1)
             out.WriteByte(SC_PrivateStream2)
-            out.WriteByte(0) : out.WriteByte(4)
-            out.WriteByte(0)               ' high byte of stream_id field
-            out.WriteByte(videoStreamId)   ' channel = stream_id & 0xF
-            out.WriteByte(&HFF) : out.WriteByte(&HFF)
-        End Sub
-
-        Private Sub EmitInitialPack(out As Stream, scr As Long, muxRateUnits As Integer)
-            Dim packStart As Long = out.Position
-            WritePackHeader(out, scr, 0, muxRateUnits)
-            WriteSystemHeader(out, muxRateUnits, VideoPstdBufferSize)
-            Dim used As Integer = CInt(out.Position - packStart)
-            Dim remaining As Integer = SectorSize - used
-            If remaining >= 7 Then
-                WritePaddingStream(out, remaining)
-            ElseIf remaining > 0 Then
-                For i As Integer = 0 To remaining - 1
-                    out.WriteByte(&H0)
-                Next
-            End If
+            out.WriteByte(0) : out.WriteByte(&H16)      ' length = 22
+            out.WriteByte(&H1)                          ' [0]
+            out.WriteByte(videoStreamId)                 ' [1]
+            out.WriteByte(0) : out.WriteByte(0)          ' [2..3] patched later
+            For i As Integer = 0 To 5
+                out.WriteByte(&HFF)                      ' [4..9]
+            Next
+            For i As Integer = 0 To 3
+                out.WriteByte(0)                         ' [10..13]
+            Next
+            out.WriteByte(0) : out.WriteByte(&H6)        ' [14..15] 0x0006
+            out.WriteByte(0) : out.WriteByte(&H1)        ' [16..17] 0x0001
+            out.WriteByte(&H20)                          ' [18]
+            out.WriteByte(If(isFirstPicture, CByte(&H2), CByte(&H1)))  ' [19]
+            out.WriteByte(CByte((CInt(vbvDelay) >> 8) And &HFF))       ' [20]
+            out.WriteByte(CByte(CInt(vbvDelay) And &HFF))              ' [21]
         End Sub
 
         Private Function HasMoreData() As Boolean
@@ -265,7 +322,7 @@ Namespace PamfMux
 
             Dim payloadFit As Integer = availBytes - VideoPesHeaderLen
             If payloadFit <= 0 Then
-                ' No room at all - fill bytes
+                ' no room at all - fill bytes
                 For i As Integer = 0 To availBytes - 1
                     out.WriteByte(&HFF)
                 Next
@@ -292,7 +349,7 @@ Namespace PamfMux
 
             ' PES occupies entire sector remainder, size pes_packet_length accordingly and pad with 0xFF after data
             WriteVideoPesHeader(out, s.PesStreamId, payloadFit, au.Pts, au.Dts,
-                                VideoPstdBufferSize)
+                                s.PstdBufferSize)
             out.Write(au.Data, consumed, chunkLen)
             For Each e In extras
                 out.Write(e.Data, 0, e.Data.Length)
@@ -328,23 +385,39 @@ Namespace PamfMux
                                       remaining As Integer,
                                       availBytes As Integer,
                                       packStart As Long)
-            ' Audio packing
+            ' audio packing
             _splitState.Remove(s.Index)
 
             Dim isLpcm As Boolean = (s.Codec = PamfStreamType.LPCM)
-            Dim lpcmExtraBytes As Integer = If(isLpcm, 13, 0)
 
-            Dim availForData As Integer = availBytes - AudioPesHeaderLen - lpcmExtraBytes
+            ' PAMF LPCM PES layout:
+            '     [0]    sub_stream_id  (0x40..0x4F)
+            '
+            '     [1]    stream config byte, constant per stream. 0x31 for 48 kHz stereo 16-bit LPCM. Exact layout unknown
+            '            observed values:
+            '              0x31 : 48 kHz stereo 16-bit
+            '            other configs need verification
+            '
+            '     [2..3] first_access_unit_pointer, high nibble is a constant marker (0x4)
+            '            the low 12 bits are the byte offset of the first new-AU boundary in the sample area of this PES
+            '            0xFFFF when no new AU begins in this PES (continuation-only)
+            '
+            '     [4..]  LPCM samples directly
+
+            Dim availForData As Integer = availBytes - AudioPesHeaderLen
             If availForData <= 0 Then
                 EmitOnlyPaddingForRest(out, availBytes)
                 Return
             End If
 
             ' step 1: continuation from previous PES of this stream
+            ' LPCM is allowed here too: at high sample rate / channel count a 20 ms
+            ' LPCM AU can exceed one sector's audio payload budget and must span
+            ' multiple PESes, exactly like a large AT3+/AC-3 frame.
             Dim contBytes As Integer = 0
             Dim contData As Byte() = Nothing
             Dim contStart As Integer = 0
-            If Not isLpcm AndAlso _audioPartial.ContainsKey(s.Index) Then
+            If _audioPartial.ContainsKey(s.Index) Then
                 Dim partialConsumed As Integer = _audioPartial(s.Index)
                 Dim partialAu As AccessUnit = s.AuQueue.Peek()
                 contData = partialAu.Data
@@ -357,15 +430,17 @@ Namespace PamfMux
             Dim packedBytes As Integer = 0
             Dim spaceForWholeAus As Integer = availForData - contBytes
 
+            Dim contFinished As Boolean = (contBytes > 0 AndAlso
+                                           contStart + contBytes >= contData.Length)
+
             ' if we just finished a continuation, dequeue that AU before packing whole ones
-            If contBytes > 0 AndAlso contStart + contBytes >= contData.Length Then
+            If contFinished Then
                 s.AuQueue.Dequeue()
                 _audioPartial.Remove(s.Index)
             End If
 
-            ' for LPCM first AU is the one caller pre-peeked
-            ' for non-LPCM with no continuation, same
-            If contBytes = 0 OrElse Not _audioPartial.ContainsKey(s.Index) Then
+            ' pack whole AUs only when we're not still mid-continuation
+            If contBytes = 0 OrElse contFinished Then
                 While s.AuQueue.Count > 0
                     Dim head As AccessUnit = s.AuQueue.Peek()
                     If packedBytes + head.Data.Length > spaceForWholeAus Then Exit While
@@ -375,10 +450,10 @@ Namespace PamfMux
                 End While
             End If
 
-            ' step 3: optionally split the next AU to fill the sector (non-LPCM only)
+            ' step 3: optionally split the next AU to fill the sector
             Dim splitAu As AccessUnit = Nothing
             Dim splitBytes As Integer = 0
-            If Not isLpcm AndAlso s.AuQueue.Count > 0 Then
+            If s.AuQueue.Count > 0 Then
                 Dim remainingSpace As Integer = spaceForWholeAus - packedBytes
                 If remainingSpace > 0 Then
                     splitAu = s.AuQueue.Peek()
@@ -410,24 +485,29 @@ Namespace PamfMux
                 ptsAu = au
             End If
 
-            ' sub-header write 4 bytes, LPCM append 13 more for au_specific_info_buf
             Dim totalAuBytes As Integer = contBytes + packedBytes + splitBytes
-            Dim subHeaderAndPayload As Integer = AudioSubHeaderLen + lpcmExtraBytes + totalAuBytes
-            WriteAudioPesHeader(out, subHeaderAndPayload, ptsAu.Pts, AudioPstdBufferSize)
+            Dim subHeaderAndPayload As Integer = AudioSubHeaderLen + totalAuBytes
+            WriteAudioPesHeader(out, subHeaderAndPayload, ptsAu.Pts, s.PstdBufferSize)
 
-            Dim firstAuPtr As UShort = CUShort(If(isLpcm, 13, contBytes))
-            ' numFrameHeaders: Sony always writes 0 here in real AA_CR.
-            ' For AT3+/AC3 the demuxer read u32 at sub-header [0..3] and mask with 0xFFFF, so byte 1 is discarded
-            ' for LPCM the mask is 0x7FF also discarding byte 1
-            WriteAudioSubHeader(out, s.SubStreamId, 0, firstAuPtr)
-
+            ' first_access_unit_pointer:
+            '   LPCM  : 0x4000 marker in the high nibble, low 12 bits are the offset of the first new-AU boundary within the sample area
+            '           0xFFFF when this PES is purely continuation of a previous AU.
+            '   AT3+/AC-3 : straight byte offset (matches the existing tool convention).
+            Dim hasNewAu As Boolean = (packed.Count > 0) OrElse (splitAu IsNot Nothing)
+            Dim firstAuPtr As UShort
+            Dim numFrameHeaders As Byte
             If isLpcm Then
-                Dim extra(12) As Byte
-                extra(0) = CByte(s.NumChannels)
-                extra(1) = 1                          ' 48 kHz code
-                extra(2) = CByte(s.BitsPerSample)
-                out.Write(extra, 0, 13)
+                firstAuPtr = If(hasNewAu, CUShort(&H4000 Or (contBytes And &HFFF)), CUShort(&HFFFF))
+                ' Sony's per-stream config byte at sub-header[1].fall back to 0x31 as a reasonable default
+                ' needs extending with different LPCM configs
+                numFrameHeaders = &H31
+            Else
+                firstAuPtr = CUShort(contBytes)
+                numFrameHeaders = 0
             End If
+            WriteAudioSubHeader(out, s.SubStreamId, numFrameHeaders, firstAuPtr)
+
+            ' NO 13-byte extra header for LPCM, samples immediately follow 4-byte audio sub-header, Sony PAMFs do not have anything here
 
             ' continuation tail, then whole AUs, then split AU head
             If contBytes > 0 Then
@@ -439,10 +519,14 @@ Namespace PamfMux
             If splitAu IsNot Nothing AndAlso splitBytes > 0 Then
                 out.Write(splitAu.Data, 0, splitBytes)
                 _audioPartial(s.Index) = splitBytes
+            ElseIf contBytes > 0 AndAlso Not contFinished Then
+                ' continuation-only PES: the head AU still has bytes we haven't emitted;
+                ' record how far in we are so the next PES resumes from the right offset
+                _audioPartial(s.Index) = contStart + contBytes
             End If
 
             ' pad leftover sector bytes (rare)
-            Dim used As Integer = AudioPesHeaderLen + lpcmExtraBytes + totalAuBytes
+            Dim used As Integer = AudioPesHeaderLen + totalAuBytes
             Dim spareInSector As Integer = availBytes - used
             If spareInSector > 0 Then
                 If spareInSector >= 7 Then
