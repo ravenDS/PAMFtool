@@ -709,9 +709,9 @@ Public Class PamfFile
                 Dim s As PamfStreamInfo = kv.Value
                 Dim stripper As Atrac3PlusAuStripper = at3Strippers(kv.Key)
                 w.BaseStream.Position = 0
-                WriteAt3RiffHeader(w, s, stripper.FramesWritten)
-                Console.WriteLine($"     at3+ s{kv.Key:D2}: {stripper.FramesWritten} frames, " &
-                                  $"{stripper.FramesWritten * Atrac3PlusAuStripper.At3pFrameSize} ES bytes")
+                WriteAt3RiffHeader(w, s, stripper)
+                Console.WriteLine($"     at3+ s{kv.Key:D2}: {stripper.FramesWritten} frames of {stripper.StrippedFrameSize} bytes " &
+                                  $"({stripper.FramesWritten * stripper.StrippedFrameSize:N0} ES bytes)")
             Next
 
         Finally
@@ -1049,24 +1049,28 @@ Public Class PamfFile
 
     Private Sub WriteAt3RiffHeader(bw As BinaryWriter,
                                    s As PamfStreamInfo,
-                                   frameCount As Long)
+                                   stripper As Atrac3PlusAuStripper)
 
         ' write RIFF/WAVE file using WAVE_FORMAT_EXTENSIBLE with Sony ATRAC3plus SubFormat GUID
 
-        ' data chunk then contains:
-        ' frameCount * 688-byte
-        ' PSP-style at3+ frames (PAMF 8-byte per-AU prefix already stripped by Atrac3PlusAuStripper)
+        ' data chunk that follows carries 'frameCount', full ATRAC-X raw_data_frame blocks
+        ' each starts with 0x0FD0 ATS sync word (nBlockAlign = same size)
         '
         ' SubFormat GUID for ATRAC3plus (little-endian):
-        ' BFAA23E9-58CB-7144-A119-FFFA01E4CE62
+        '   BFAA23E9-58CB-7144-A119-FFFA01E4CE62
         '
-        ' total header size is Atrac3PlusAuStripper.At3RiffHeaderLen (=72) bytes
+        ' total header size is Atrac3PlusAuStripper.At3RiffHeaderLen (=84 bytes).
         Dim channels As Integer = If(s.NumChannels > 0, CInt(s.NumChannels), 2)
         Dim sampleRate As Integer = If(s.SampleRate > 0, s.SampleRate, 48000)
-        Dim frameSize As Integer = Atrac3PlusAuStripper.At3pFrameSize         ' 688
-        Dim avgBps As Integer = CInt(CLng(frameSize) * sampleRate \ 2048)
+        Dim frameSize As Integer = stripper.StrippedFrameSize
+        If frameSize <= 0 Then
+            ' fallback, this shouldn't happen for a stream with any AT3+ frames
+            frameSize = 688
+        End If
+        Dim frameCount As Long = stripper.FramesWritten
+        Dim avgBps As Integer = CInt(CLng(frameSize) * sampleRate \ Atrac3PlusAuStripper.SamplesPerFrame)
         Dim dataBytes As Long = frameCount * frameSize
-        Dim samplesTot As Long = frameCount * 2048
+        Dim samplesTot As Long = frameCount * Atrac3PlusAuStripper.SamplesPerFrame
 
         Dim guid() As Byte = New Byte() {
             &HBF, &HAA, &H23, &HE9, &H58, &HCB, &H71, &H44,
@@ -1081,6 +1085,16 @@ Public Class PamfFile
         ' RIFF header (12 bytes) + fmt chunk (8+40=48) + fact chunk (8+8=16) + data chunk header (8) = 84 bytes of header before payload
         Dim riffSize As Long = CLng(4 + 48 + 16 + 8) + dataBytes
 
+        ' KSAUDIO channel masks
+        Dim mask As UInteger
+        Select Case channels
+            Case 1 : mask = &H4UI        ' FC
+            Case 2 : mask = &H3UI        ' FL FR
+            Case 6 : mask = &H3FUI       ' FL FR FC LFE BL BR (5.1)
+            Case 8 : mask = &H63FUI      ' FL FR FC LFE BL BR SL SR (7.1)
+            Case Else : mask = 0UI
+        End Select
+
         bw.Write(Encoding.ASCII.GetBytes("RIFF"))
         bw.Write(CUInt(Math.Min(riffSize, &HFFFFFFFFL)))
         bw.Write(Encoding.ASCII.GetBytes("WAVE"))
@@ -1091,11 +1105,11 @@ Public Class PamfFile
         bw.Write(CUShort(channels))
         bw.Write(CInt(sampleRate))
         bw.Write(CInt(avgBps))
-        bw.Write(CUShort(frameSize))          ' nBlockAlign  = stripped at3+ frame size
+        bw.Write(CUShort(frameSize))          ' nBlockAlign = raw_data_frame size (ATS header stripped)
         bw.Write(CUShort(0))                  ' wBitsPerSample (compressed)
         bw.Write(CUShort(22))                 ' cbSize (extension length)
-        bw.Write(CUShort(2048))               ' wValidBitsPerSample = samples/block
-        bw.Write(CUInt(If(channels = 1, &H4UI, &H3UI)))  ' speaker mask
+        bw.Write(CUShort(Atrac3PlusAuStripper.SamplesPerFrame))   ' wValidBitsPerSample = samples/block
+        bw.Write(mask)
         bw.Write(guid)
 
         bw.Write(Encoding.ASCII.GetBytes("fact"))
@@ -1127,14 +1141,25 @@ End Class
 ' +4..+7   0x00000000  reserved / zero
 ' +8..+695 688-byte standard ATRAC3plus frame
 '
-' ffmpeg atrac3p decoder expects only the last 688 bytes
-
-' AU span PES boundaries, so we feed every audio-payload byte through per-stream rolling buffer and emit 688-byte frames whenever full 696-byte AU has accumulated
+' a PAMF ATRAC3plus access unit is exactly one ATRAC-X raw_data_frame preceded by an 8-byte ATS header 
+' the ATS header starts with 0x0FD0 and encodes frame length in next 16 bits
+'
+' frame_size = ((data & 0x3ff) + 1) * 8 + 8   [ATS_HEADER_SIZE = 8]
+'
+' size is uniform across a stream but VARIES BY CHANNEL COUNT AND BITRATE:
+'   stereo 128 kbps  ->  696 bytes  (data & 0x3ff = 85)
+'   5.1   ~315 kbps  -> 1720 bytes  (data & 0x3ff = 213)
+'
+' frames span PES boundaries, so
+' - feed every audio-payload byte through per-stream rolling buffer
+' - size-lock on the first ATS header
+' - emit each frame with 8-byte ATS header stripped off (needed for ffmpeg/VLC compatibility)
+'
 Friend Class Atrac3PlusAuStripper
 
-    Public Const PamfAuSize As Integer = 696   ' AU as it appears in PAMF
-    Public Const PamfAuHeaderLen As Integer = 8     ' 0FD0 4855 00000000 prefix
-    Public Const At3pFrameSize As Integer = PamfAuSize - PamfAuHeaderLen  ' 688
+    Public Const AtsHeaderSize As Integer = 8      ' 0x0FD0 sync (2) + size (2) + reserved (4)
+    Public Const SyncWord As Integer = &HFD0
+    Public Const SamplesPerFrame As Integer = 2048
 
     ' Header byte count produced by WriteAt3RiffHeader. ExtractAll reserves these bytes at the head of every at3+ output before demux
     ' 12 bytes RIFF / size / WAVE
@@ -1144,28 +1169,72 @@ Friend Class Atrac3PlusAuStripper
     Public Const At3RiffHeaderLen As Integer = 84
 
     Private ReadOnly _bw As BinaryWriter
-    Private ReadOnly _au As Byte()
+    Private _frameSize As Integer = 0     ' full frame size incl. ATS header, resolved from the first ATS we see
+    Private _sizeProbe As Byte()          ' rolling 4-byte probe used until _frameSize is known
+    Private _sizeProbeFilled As Integer = 0
+    Private _frame As Byte()              ' full-frame buffer (allocated once frameSize is known)
     Private _filled As Integer = 0
     Public Property FramesWritten As Long
 
+    ' StrippedFrameSize is 0 until first ATS header has been parsed
+    ' callers should read it after demux to fill the RIFF fmt chunk's nBlockAlign
+    Public ReadOnly Property StrippedFrameSize As Integer
+        Get
+            Return If(_frameSize > 0, _frameSize - AtsHeaderSize, 0)
+        End Get
+    End Property
+
     Public Sub New(bw As BinaryWriter)
         _bw = bw
-        _au = New Byte(PamfAuSize - 1) {}
+        _sizeProbe = New Byte(3) {}
     End Sub
 
     Public Sub Append(source As Byte(), offset As Integer, count As Integer)
         Dim p As Integer = offset
         Dim remain As Integer = count
-        While remain > 0
-            Dim need As Integer = PamfAuSize - _filled
+
+        ' haven't seen the ATS header yet
+        ' buffer bytes into the 4-byte probe until we can parse frame size
+        If _frameSize = 0 Then
+            While remain > 0 AndAlso _sizeProbeFilled < 4
+                _sizeProbe(_sizeProbeFilled) = source(p)
+                _sizeProbeFilled += 1
+                p += 1
+                remain -= 1
+            End While
+
+            If _sizeProbeFilled = 4 Then
+                Dim sync As Integer = (CInt(_sizeProbe(0)) << 8) Or _sizeProbe(1)
+                If sync <> SyncWord Then
+                    Throw New InvalidDataException(
+                        $"ATRAC3plus stream doesn't start with sync word 0x0FD0; got 0x{sync:X4}. " &
+                        "Extraction of this stream is unsupported.")
+                End If
+                Dim data As Integer = (CInt(_sizeProbe(2)) << 8) Or _sizeProbe(3)
+                Dim n As Integer = data And &H3FF
+                If n >= &H200 Then
+                    Throw New InvalidDataException(
+                        $"ATRAC3plus ATS header advertises out-of-range frame size (n=0x{n:X}).")
+                End If
+                _frameSize = (n + 1) * 8 + AtsHeaderSize
+                _frame = New Byte(_frameSize - 1) {}
+                ' seed the frame buffer with the 4 probe bytes we've already consumed
+                Buffer.BlockCopy(_sizeProbe, 0, _frame, 0, 4)
+                _filled = 4
+            End If
+        End If
+
+        ' accumulate whole frames, emit each minus 8-byte ATS header
+        ' (frame_size - 8) bytes of raw_data_frame content
+        While remain > 0 AndAlso _frameSize > 0
+            Dim need As Integer = _frameSize - _filled
             Dim take As Integer = If(need <= remain, need, remain)
-            Buffer.BlockCopy(source, p, _au, _filled, take)
+            Buffer.BlockCopy(source, p, _frame, _filled, take)
             _filled += take
             p += take
             remain -= take
-            If _filled = PamfAuSize Then
-                ' Emit only the at3+ payload, dropping the 8-byte PAMF prefix.
-                _bw.Write(_au, PamfAuHeaderLen, At3pFrameSize)
+            If _filled = _frameSize Then
+                _bw.Write(_frame, AtsHeaderSize, _frameSize - AtsHeaderSize)
                 FramesWritten += 1
                 _filled = 0
             End If
