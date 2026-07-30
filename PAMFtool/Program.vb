@@ -25,6 +25,8 @@ Module Program
         ' -mmb <n> : override max_mean_bitrate in AVC codec_info byte 25
         ' Sony encodes 11 for 1080p L4.1 CABAC and 5 for 720p L3.1 CAVLC, some games may inspect it
         Dim overrideMmb As Integer = -1
+        ' -ps2-block <N> : private_stream_2 cadence in AUs, default = 12
+        Dim ps2FramesPerBlock As Integer = 12
         Dim i As Integer = 0
         While i < args.Length
             Dim a As String = args(i)
@@ -68,6 +70,13 @@ Module Program
                         Environment.Exit(1)
                     End If
                     i += 1
+                Case "-ps2-block", "--ps2-block", "/ps2-block"
+                    If i + 1 >= args.Length OrElse Not Integer.TryParse(args(i + 1), ps2FramesPerBlock) _
+                       OrElse ps2FramesPerBlock < 0 OrElse ps2FramesPerBlock > 255 Then
+                        Console.Error.WriteLine("Error: -ps2-block requires a value 0..255 (12/29/10 for Sony PAMFs, 0 = legacy 4-byte marker).")
+                        Environment.Exit(1)
+                    End If
+                    i += 1
                 Case "-h", "--help", "/?", "/h", "-?"
                     PrintUsage() : Return
                 Case Else : positional.Add(a)
@@ -99,7 +108,7 @@ Module Program
                 positional.Add(BuildAutoRemuxPath(positional(0)))
             End If
             PamfMuxRunner.Run(positional, noEp, forceDeblock, forceNoDeblock, noAtsc, paceMbps,
-                              overridePstdKb, overrideMmb)
+                              overridePstdKb, overrideMmb, ps2FramesPerBlock)
             Return
         End If
 

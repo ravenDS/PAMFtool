@@ -12,6 +12,11 @@ Namespace PamfMux
         Public Property Pts As Long
         Public Property Dts As Long
         Public Property IsRandomAccessPoint As Boolean
+        ' true for AUs that are used as REFERENCE for other frames (I, P slices in AVC / any anchor picture in M2V)
+        ' false for non-reference B slices
+        ' detected from AVC nal_ref_idc of the first VCL NALU: 0 = non-ref, non-zero = ref
+        ' used only to set bit 7 of the flag byte in private_stream_2 marker
+        Public Property IsReferenceFrame As Boolean = True
         ' video-only metadata, populated by RegisterAndQueueM2v, used to fill private_stream_2 emitted at each AU start pack
         Public Property VideoPictureIndex As Integer     ' 0-based, first picture in stream = 0
         Public Property VideoVbvDelay As UShort          ' from MPEG-2 picture_header
@@ -30,6 +35,7 @@ Namespace PamfMux
         Public ReadOnly Property AuQueue As New Queue(Of AccessUnit)()
         Public Property LastQueuedPts As Long
         Public ReadOnly Property EpEntries As New List(Of EpEntry)()
+        Public Property NextAuEmitIndex As Integer
 
         Public ReadOnly Property IsVideo As Boolean
             Get
@@ -64,6 +70,11 @@ Namespace PamfMux
 
         ' rate at which SCR advances between packs, independent of MuxRateBps 
         Public Property EffectiveDeliveryBps As Integer = 48_000_000
+
+        ' private_stream_2 emission cadence for AVC RAPs
+        ' when > 0, emit the 66-byte marker every N AUs carrying an N-frame-size lookahead.
+        ' when 0, emit only the legacy 4-byte AVC RAP marker at every IDR (older behavior, kept for compatibility)
+        Public Property Ps2FramesPerBlock As Integer = 12
         ' Legacy: audio P-STD used for non-LPCM audio when a stream doesn't have its own.
         ' Video P-STD now lives per-stream on PamfMuxStream.PstdBufferSize.
         Public Property AudioPstdBufferSize As Integer = 20
@@ -190,7 +201,22 @@ Namespace PamfMux
                                                head.VideoPictureIndex = 0, head.VideoVbvDelay)
                         _ps2Offsets.Add(ps2Off)
                         spaceLeft = SectorSize - CInt(output.Position - packStart)
-                    ElseIf head.IsRandomAccessPoint Then
+                    ElseIf Ps2FramesPerBlock > 0 AndAlso s.NextAuEmitIndex Mod Ps2FramesPerBlock = 0 Then
+                        WriteSystemHeader(output, muxRateUnits, s.PstdBufferSize)
+                        Dim n As Integer = Ps2FramesPerBlock
+                        Dim sizes(n - 1) As Integer
+                        Dim refs(n - 1) As Boolean
+                        Dim k As Integer = 0
+                        For Each au In s.AuQueue
+                            If k >= n Then Exit For
+                            sizes(k) = au.Data.Length
+                            refs(k) = au.IsReferenceFrame
+                            k += 1
+                        Next
+                        WriteAvcRapMarkerSony(output, s.PesStreamId, n, sizes, refs)
+                        spaceLeft = SectorSize - CInt(output.Position - packStart)
+                    ElseIf Ps2FramesPerBlock = 0 AndAlso head.IsRandomAccessPoint Then
+                        ' legacy 4-byte stub, emitted at every IDR AU
                         WriteSystemHeader(output, muxRateUnits, s.PstdBufferSize)
                         WriteRapMarker(output, s.PesStreamId)
                         spaceLeft = SectorSize - CInt(output.Position - packStart)
@@ -242,6 +268,87 @@ Namespace PamfMux
         ' payload that identifies the video stream. The tool's own demuxer doesn't
         ' parse this today; it's here because Sony PAMF hardware expects it (removing
         ' it entirely produced files the PS3 refused to play back).
+
+        ' private_stream_2 marker for AVC RAPs:
+        '
+        ' N frames per block
+        ' payload = 18 + 4*N bytes (66 for N=12, 134 for N=29, 58 for N=10)
+        ' emitted every N AUs
+
+        ' carries frame-size lookahead so the hardware CABAC decoder can pre-allocate resources
+        '
+        ' payload layout:
+        '   [0]      0x01 (fixed record marker)
+        '   [1]      video_stream_id (0xE0 for the first video stream)
+        '   [2..3]   BE u16 - cumulative_bytes_thru_frame_0 / 2048
+        '   [4..5]   BE u16 - cumulative_bytes_thru_frame_1 / 2048
+        '   [6..7]   BE u16 - cumulative_bytes_thru_frame_2 / 2048
+        '   [8..9]   BE u16 - cumulative_bytes_thru_frame_3 / 2048
+        '   [10..13] 00 00 00 00 (reserved)
+        '   [14..15] BE u16 - value 4*N + 2 (semantic unknown, formula holds across all three observed N values 12,29,10)
+        '   [16..17] BE u16 - frame count N in this block
+        '   [18]     00
+        '   [19..]   N groups of 4 bytes, one per frame in the next N-frame window (in decode order).
+        '            each group encodes a 24-bit unsigned frame size (bytes of the AU as it appears in the ES)
+        '            plus a reference-frame flag:
+        '                [ (is_ref ? 0x80 : 0x00) | ((size >> 16) & 3),
+        '                  (size >> 8) & 0xFF,
+        '                  size & 0xFF,
+        '                  0x00 ]
+        '            capped to 0x3FFFFF (~4 MB)
+        Private Sub WriteAvcRapMarkerSony(out As Stream, videoStreamId As Byte,
+                                           framesPerBlock As Integer,
+                                           frameSizes As Integer(),
+                                           isReference As Boolean())
+            Dim payloadLen As Integer = 18 + 4 * framesPerBlock
+            out.WriteByte(0) : out.WriteByte(0) : out.WriteByte(1)
+            out.WriteByte(SC_PrivateStream2)
+            out.WriteByte(CByte((payloadLen >> 8) And &HFF))
+            out.WriteByte(CByte(payloadLen And &HFF))
+
+            ' header (18 bytes: indices 0..17)
+            out.WriteByte(&H1)                          ' [0]
+            out.WriteByte(videoStreamId)                ' [1]
+
+            ' cumulative sector offsets thru frames 0..3.
+            ' if fewer than 4 frames are available (end of stream), remaining offsets stay 0
+            Dim cum As Long = 0
+            For k As Integer = 0 To 3
+                If k < frameSizes.Length Then
+                    cum += frameSizes(k)
+                    Dim sectors As Integer = CInt(cum \ 2048L)
+                    If sectors > &HFFFF Then sectors = &HFFFF
+                    out.WriteByte(CByte((sectors >> 8) And &HFF))
+                    out.WriteByte(CByte(sectors And &HFF))
+                Else
+                    out.WriteByte(0) : out.WriteByte(0)
+                End If
+            Next
+
+            out.WriteByte(0) : out.WriteByte(0)          ' [10..11]
+            out.WriteByte(0) : out.WriteByte(0)          ' [12..13]
+            Dim field14 As Integer = 4 * framesPerBlock + 2
+            out.WriteByte(CByte((field14 >> 8) And &HFF))
+            out.WriteByte(CByte(field14 And &HFF))       ' [14..15] = 4N+2
+            out.WriteByte(CByte((framesPerBlock >> 8) And &HFF))
+            out.WriteByte(CByte(framesPerBlock And &HFF)) ' [16..17] = N
+
+            ' N frame-size groups (4*N bytes, starting at byte 18)
+            ' each group: [leading_zero=0, flag, hi_size, lo_size]
+            For k As Integer = 0 To framesPerBlock - 1
+                Dim size As Integer = 0
+                Dim isRef As Boolean = True
+                If k < frameSizes.Length Then size = frameSizes(k)
+                If k < isReference.Length Then isRef = isReference(k)
+                If size > &H3FFFFF Then size = &H3FFFFF
+                Dim flag As Integer = If(isRef, &H80, &H0) Or ((size >> 16) And &H3)
+                out.WriteByte(0)
+                out.WriteByte(CByte(flag And &HFF))
+                out.WriteByte(CByte((size >> 8) And &HFF))
+                out.WriteByte(CByte(size And &HFF))
+            Next
+        End Sub
+
         Private Sub WriteRapMarker(out As Stream, videoStreamId As Byte)
             out.WriteByte(0) : out.WriteByte(0) : out.WriteByte(1)
             out.WriteByte(SC_PrivateStream2)
@@ -463,9 +570,11 @@ Namespace PamfMux
 
             If auFullyConsumed Then
                 s.AuQueue.Dequeue()
+                s.NextAuEmitIndex += 1
                 _splitState.Remove(s.Index)
                 For Each e In extras
                     s.AuQueue.Dequeue()
+                    s.NextAuEmitIndex += 1
                 Next
             Else
                 _splitState(s.Index) = consumed + chunkLen

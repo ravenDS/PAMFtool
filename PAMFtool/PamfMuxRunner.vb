@@ -19,9 +19,10 @@ Friend Module PamfMuxRunner
                    noAtsc As Boolean,
                    paceMbps As Double,
                    overridePstdKb As Integer,
-                   overrideMmb As Integer)
+                   overrideMmb As Integer,
+                   ps2FramesPerBlock As Integer)
         If positional.Count < 2 Then
-            Console.Error.WriteLine("Usage: PamfExtractor -mux <inputDir> <output.pamf> [-noep] [-noatsc] [-deblock | -nodeblock] [-pace <Mbps|auto|off>] [-pstd <KB>] [-mmb <n>]")
+            Console.Error.WriteLine("Usage: PamfExtractor -mux <inputDir> <output.pamf> [-noep] [-noatsc] [-deblock | -nodeblock] [-pace <Mbps|auto|off>] [-pstd <KB>] [-mmb <n>] [-ps2-block <N>]")
             Environment.Exit(1)
         End If
         Dim inDir As String = positional(0)
@@ -48,6 +49,11 @@ Friend Module PamfMuxRunner
         If noAtsc Then Console.WriteLine("  -noatsc: ATRAC3+ ATS extra_config_data forced to zero (ignores atsc chunk)")
         If overridePstdKb > 0 Then Console.WriteLine($"  -pstd {overridePstdKb}: overriding AVC P-STD buffer size to {overridePstdKb} KB")
         If overrideMmb >= 0 Then Console.WriteLine($"  -mmb {overrideMmb}: overriding max_mean_bitrate byte to {overrideMmb}")
+        If ps2FramesPerBlock = 0 Then
+            Console.WriteLine("  -ps2-block 0: emitting legacy 4-byte ps2 marker at every IDR")
+        Else
+            Console.WriteLine($"  ps2 cadence: {ps2FramesPerBlock}-frame block, {18 + 4 * ps2FramesPerBlock}-byte payload every {ps2FramesPerBlock} AUs")
+        End If
         If paceMbps > 0 Then
             Console.WriteLine($"  -pace {paceMbps} Mbps: SCR pacing at fixed rate (mux_rate field stays 48 Mbps)")
         ElseIf paceMbps < 0 Then
@@ -58,7 +64,7 @@ Friend Module PamfMuxRunner
 
         Console.WriteLine("Muxing to: " & outPath)
         BuildPamfFromFiles(files, outPath, noEp, forceDeblock, forceNoDeblock, noAtsc, paceMbps,
-                           overridePstdKb, overrideMmb)
+                           overridePstdKb, overrideMmb, ps2FramesPerBlock)
         Dim sz As Long = New FileInfo(outPath).Length
         Console.WriteLine("Wrote " & outPath & " (" & sz.ToString("N0") & " bytes)")
     End Sub
@@ -117,9 +123,11 @@ Friend Module PamfMuxRunner
                                    forceNoDeblock As Boolean, noAtsc As Boolean,
                                    paceMbps As Double,
                                    overridePstdKb As Integer,
-                                   overrideMmb As Integer)
+                                   overrideMmb As Integer,
+                                   ps2FramesPerBlock As Integer)
         Dim mux As New PamfMuxer()
         mux.SkipEpTable = noEp
+        mux.PsMuxer.Ps2FramesPerBlock = ps2FramesPerBlock
 
         ' for each input, parse codec metadata, register the stream, then slice into AUs and queue
         For Each f In files
@@ -255,10 +263,38 @@ Friend Module PamfMuxRunner
             Dim dts As Long = pts - tickPerFrame
             mux.QueueAu(ps, New AccessUnit() With {
                 .Data = au, .Pts = pts, .Dts = dts,
-                .IsRandomAccessPoint = AvcAuContainsIdr(au)
+                .IsRandomAccessPoint = AvcAuContainsIdr(au),
+                .IsReferenceFrame = AvcAuFirstVclIsReference(au)
             })
         Next
     End Sub
+
+    ' AVC "reference" detection: examine the FIRST VCL NAL unit in the AU
+    '
+    ' (nal_unit_type 1 = non-IDR slice or 5 = IDR slice)
+    '
+    ' read its nal_ref_idc field, which lives in bits 5-6 of the NAL header byte
+    ' nal_ref_idc == 0 means the picture is not used as a reference for later frames
+    ' nonzero means it is a reference (I,P, or reference B)
+    Private Function AvcAuFirstVclIsReference(au As Byte()) As Boolean
+        Dim i As Integer = 0
+        While i < au.Length - 4
+            If au(i) = 0 AndAlso au(i + 1) = 0 Then
+                Dim hdr As Integer = -1
+                If au(i + 2) = 1 Then hdr = i + 3
+                If au(i + 2) = 0 AndAlso (i + 3) < au.Length AndAlso au(i + 3) = 1 Then hdr = i + 4
+                If hdr >= 0 AndAlso hdr < au.Length Then
+                    Dim nt As Integer = au(hdr) And &H1F
+                    If nt = 1 OrElse nt = 5 Then
+                        ' VCL NAL - inspect nal_ref_idc
+                        Return ((au(hdr) >> 5) And &H3) <> 0
+                    End If
+                End If
+            End If
+            i += 1
+        End While
+        Return True
+    End Function
 
     Private Function FindAvcAuStarts(bytes As Byte()) As List(Of Integer)
         ' H.264 AU boundary detection
