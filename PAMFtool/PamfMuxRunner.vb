@@ -15,9 +15,10 @@ Friend Module PamfMuxRunner
     Public Sub Run(positional As List(Of String),
                    noEp As Boolean,
                    forceDeblock As Boolean,
-                   forceNoDeblock As Boolean)
+                   forceNoDeblock As Boolean,
+                   noAtsc As Boolean)
         If positional.Count < 2 Then
-            Console.Error.WriteLine("Usage: PamfExtractor -mux <inputDir> <output.pamf> [-noep] [-deblock | -nodeblock]")
+            Console.Error.WriteLine("Usage: PamfExtractor -mux <inputDir> <output.pamf> [-noep] [-noatsc] [-deblock | -nodeblock]")
             Environment.Exit(1)
         End If
         Dim inDir As String = positional(0)
@@ -41,9 +42,10 @@ Friend Module PamfMuxRunner
         If noEp Then Console.WriteLine("  -noep: EP table will be omitted")
         If forceDeblock Then Console.WriteLine("  -deblock: forcing deblock byte to 1")
         If forceNoDeblock Then Console.WriteLine("  -nodeblock: forcing deblock byte to 0")
+        If noAtsc Then Console.WriteLine("  -noatsc: ATRAC3+ ATS extra_config_data forced to zero (ignores atsc chunk)")
 
         Console.WriteLine("Muxing to: " & outPath)
-        BuildPamfFromFiles(files, outPath, noEp, forceDeblock, forceNoDeblock)
+        BuildPamfFromFiles(files, outPath, noEp, forceDeblock, forceNoDeblock, noAtsc)
         Dim sz As Long = New FileInfo(outPath).Length
         Console.WriteLine("Wrote " & outPath & " (" & sz.ToString("N0") & " bytes)")
     End Sub
@@ -99,7 +101,7 @@ Friend Module PamfMuxRunner
 
     Private Sub BuildPamfFromFiles(files As List(Of MuxInput), outPath As String,
                                    noEp As Boolean, forceDeblock As Boolean,
-                                   forceNoDeblock As Boolean)
+                                   forceNoDeblock As Boolean, noAtsc As Boolean)
         Dim mux As New PamfMuxer()
         mux.SkipEpTable = noEp
 
@@ -108,7 +110,7 @@ Friend Module PamfMuxRunner
             Select Case f.Kind
                 Case "avc" : RegisterAndQueueAvc(mux, f, forceDeblock, forceNoDeblock)
                 Case "mpeg2" : RegisterAndQueueM2v(mux, f)
-                Case "atrac3plus" : RegisterAndQueueAt3p(mux, f)
+                Case "atrac3plus" : RegisterAndQueueAt3p(mux, f, noAtsc)
                 Case "ac3" : RegisterAndQueueAc3(mux, f)
                 Case "lpcm" : RegisterAndQueueLpcm(mux, f)
             End Select
@@ -495,17 +497,23 @@ Friend Module PamfMuxRunner
     '
     ' Each PAMF ATRAC3plus AU on the wire is:
     ' [ 8-byte ATS header ] [ raw_data_frame ]
-
+    '
     ' our extractor strips the ATS header and stores "extra_config_data" in custom "atsc" RIFF chunk so we can round-trip it here
+    '
+    ' fallbacks (in order):
+    '  * -noatsc CLI flag on the mux            : always emit zeros for bytes 4-7
+    '  * .at3 has atsc chunk of size N*4        : use per-frame (preferred)
+    '  * .at3 has legacy atsc chunk of size 4   : broadcast that single value to every frame
+    '  * .at3 has no atsc chunk at all          : zero bytes 4-7
+    '
+    ' sync/params bytes (0..3) are always synthesized from channels + sample_rate + block_align
 
-    ' if .at3 has no atsc chunk (older extract, or file produced by at3tool.exe / vgmstream) the extra_config_data falls back to 0
-
-    Private Sub RegisterAndQueueAt3p(mux As PamfMuxer, f As MuxInput)
+    Private Sub RegisterAndQueueAt3p(mux As PamfMuxer, f As MuxInput, noAtsc As Boolean)
         Dim chs As Integer = 0
         Dim sr As Integer = 0
         Dim frameSize As Integer = 0
-        Dim extraCfg(3) As Byte
-        Dim frames As List(Of Byte()) = ReadAt3Frames(f.Path, chs, sr, frameSize, extraCfg)
+        Dim perFrameExtra As List(Of Byte()) = Nothing
+        Dim frames As List(Of Byte()) = ReadAt3Frames(f.Path, chs, sr, frameSize, perFrameExtra)
         Dim ps As PamfMuxStream = mux.AddAtrac3plusStream(numChannels:=CByte(chs))
 
         ' ATS header params field layout:
@@ -547,18 +555,25 @@ Friend Module PamfMuxRunner
         ' pts_step = 2048 * 90000 / sample_rate
         Dim ptsStep As Long = CLng(2048L * 90000L \ CLng(sr))
         Dim ptsBase As Long = 90000L
+        Dim zeros(3) As Byte
         For i As Integer = 0 To frames.Count - 1
             Dim raw As Byte() = frames(i)
+            Dim ec As Byte()
+            If noAtsc OrElse perFrameExtra Is Nothing OrElse i >= perFrameExtra.Count Then
+                ec = zeros
+            Else
+                ec = perFrameExtra(i)
+            End If
             ' build the PAMF AU: 8-byte ATS header + raw_data_frame
             Dim pamfAu(8 + raw.Length - 1) As Byte
             pamfAu(0) = &HF                            ' sync high byte
             pamfAu(1) = &HD0                           ' sync low byte
             pamfAu(2) = CByte((params >> 8) And &HFF)  ' params high byte
             pamfAu(3) = CByte(params And &HFF)         ' params low byte
-            pamfAu(4) = extraCfg(0)
-            pamfAu(5) = extraCfg(1)
-            pamfAu(6) = extraCfg(2)
-            pamfAu(7) = extraCfg(3)
+            pamfAu(4) = ec(0)
+            pamfAu(5) = ec(1)
+            pamfAu(6) = ec(2)
+            pamfAu(7) = ec(3)
             Array.Copy(raw, 0, pamfAu, 8, raw.Length)
             mux.QueueAu(ps, New AccessUnit() With {
                 .Data = pamfAu, .Pts = ptsBase + CLng(i) * ptsStep,
@@ -571,11 +586,13 @@ Friend Module PamfMuxRunner
     Private Function ReadAt3Frames(path As String, ByRef channels As Integer,
                                    ByRef sampleRate As Integer,
                                    ByRef frameSize As Integer,
-                                   ByRef extraConfigData As Byte()) As List(Of Byte())
+                                   ByRef perFrameExtra As List(Of Byte())) As List(Of Byte())
         ' parse RIFF/WAVE-style .at3 file:
-        '   WAVE_FORMAT_EXTENSIBLE (0xFFFE) with AT3+ SubFormat GUID
-        '   nBlockAlign = raw_data_frame size (ATS header stripped)
-        '   optional "atsc" chunk (4 bytes) carrying ATS extra_config_data
+        '  WAVE_FORMAT_EXTENSIBLE (0xFFFE) with AT3+ SubFormat GUID
+        '  nBlockAlign = raw_data_frame size (ATS header stripped)
+        '  optional "atsc" chunk of size N*4 OR 4 (see fallbacks below)
+        '
+        ' 'perFrameExtra' is set to a list of 4-byte ATS extra_config_data entries
         Dim data As Byte() = File.ReadAllBytes(path)
         If data.Length < 12 Then Throw New InvalidDataException("Tiny .at3 file: " & path)
         If data(0) <> &H52 OrElse data(1) <> &H49 _
@@ -585,7 +602,9 @@ Friend Module PamfMuxRunner
         Dim pos As Integer = 12
         Dim dataOff As Integer = -1
         Dim dataLen As Integer = 0
-        Dim atscSeen As Boolean = False
+        Dim atscOff As Integer = -1
+        Dim atscSize As Integer = 0
+        ' walk ALL chunks (not just those before data), because our extractor emits atsc AFTER data chunk now
         While pos < data.Length - 8
             Dim chunkId As String = System.Text.Encoding.ASCII.GetString(data, pos, 4)
             Dim chunkSize As Integer = BitConverter.ToInt32(data, pos + 4)
@@ -595,26 +614,17 @@ Friend Module PamfMuxRunner
                 sampleRate = BitConverter.ToInt32(data, pos + 8 + 4)
                 frameSize = BitConverter.ToUInt16(data, pos + 8 + 12)
             ElseIf chunkId = "atsc" Then
-                ' 4 bytes of ATS extra_config_data snapshotted at extract time
-                If chunkSize >= 4 Then
-                    Array.Copy(data, pos + 8, extraConfigData, 0, 4)
-                    atscSeen = True
-                End If
+                atscOff = pos + 8
+                atscSize = chunkSize
             ElseIf chunkId = "data" Then
                 dataOff = pos + 8
                 dataLen = chunkSize
-                Exit While
             End If
             pos += 8 + chunkSize
             If (chunkSize And 1) = 1 Then pos += 1
         End While
         If dataOff < 0 Then Throw New InvalidDataException("No data chunk in .at3: " & path)
         If frameSize <= 0 Then frameSize = 688
-        If Not atscSeen Then
-            ' older extracts and .at3 files from at3tool/vgmstream don't carry the ATS extra_config_data
-            ' zero is a safe default
-            Array.Clear(extraConfigData, 0, 4)
-        End If
 
         Dim frames As New List(Of Byte())()
         Dim n As Integer = dataLen \ frameSize
@@ -623,6 +633,31 @@ Friend Module PamfMuxRunner
             Array.Copy(data, dataOff + i * frameSize, frame, 0, frameSize)
             frames.Add(frame)
         Next
+
+        ' resolve extra_config_data source:
+        '  - atsc chunk size == n * 4  -> per-frame list (preferred)
+        '  - atsc chunk size == 4      -> broadcast to every frame (legacy)
+        '  - anything else / no chunk  -> nothing (caller zero-fills)
+        perFrameExtra = Nothing
+        If atscOff >= 0 Then
+            If atscSize = n * 4 AndAlso n > 0 Then
+                perFrameExtra = New List(Of Byte())()
+                For i As Integer = 0 To n - 1
+                    Dim ec(3) As Byte
+                    Array.Copy(data, atscOff + i * 4, ec, 0, 4)
+                    perFrameExtra.Add(ec)
+                Next
+            ElseIf atscSize = 4 AndAlso n > 0 Then
+                ' legacy per-stream atsc. Broadcast.
+                perFrameExtra = New List(Of Byte())()
+                Dim broadcast(3) As Byte
+                Array.Copy(data, atscOff, broadcast, 0, 4)
+                For i As Integer = 0 To n - 1
+                    perFrameExtra.Add(broadcast)
+                Next
+            End If
+        End If
+
         Return frames
     End Function
 

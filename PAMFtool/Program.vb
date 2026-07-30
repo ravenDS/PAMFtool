@@ -14,6 +14,7 @@ Module Program
         Dim noEp As Boolean = False
         Dim forceDeblock As Boolean = False
         Dim forceNoDeblock As Boolean = False
+        Dim noAtsc As Boolean = False
         For Each a In args
             Select Case a.ToLowerInvariant()
                 Case "-info", "--info", "/info" : infoOnly = True
@@ -22,6 +23,7 @@ Module Program
                 Case "-noep", "--noep", "/noep" : noEp = True
                 Case "-deblock", "--deblock", "/deblock" : forceDeblock = True
                 Case "-nodeblock", "--nodeblock", "/nodeblock" : forceNoDeblock = True
+                Case "-noatsc", "--noatsc", "/noatsc" : noAtsc = True
                 Case "-h", "--help", "/?", "/h", "-?"
                     PrintUsage() : Return
                 Case Else : positional.Add(a)
@@ -51,7 +53,7 @@ Module Program
             If positional.Count = 1 AndAlso Directory.Exists(positional(0)) Then
                 positional.Add(BuildAutoRemuxPath(positional(0)))
             End If
-            PamfMuxRunner.Run(positional, noEp, forceDeblock, forceNoDeblock)
+            PamfMuxRunner.Run(positional, noEp, forceDeblock, forceNoDeblock, noAtsc)
             Return
         End If
 
@@ -77,10 +79,11 @@ Module Program
         Console.WriteLine("PlayStation Advanced Movie Format (PAMF) Muxer/Demuxer")
         Console.WriteLine()
         Console.WriteLine("Demux:  PAMFtool [-demux] <input.pamf> [outDir] [-info]")
-        Console.WriteLine("Mux:    PAMFtool [-mux]   <inputDir>   [output.pamf] [-noep] [-deblock | -nodeblock]")
+        Console.WriteLine("Mux:    PAMFtool [-mux]   <inputDir>   [output.pamf] [-noep] [-noatsc] [-deblock | -nodeblock]")
         Console.WriteLine()
         Console.WriteLine("Mux parameters:")
         Console.WriteLine("  -noep       Skip writing an entry-point seek table in the header.")
+        Console.WriteLine("  -noatsc     Ignore any 'atsc' RIFF chunk in .at3 inputs.")
         Console.WriteLine("  -deblock    Force codec-info deblock byte to 1 (overrides PPS-derived value).")
         Console.WriteLine("  -nodeblock  Force codec-info deblock byte to 0 (overrides PPS-derived value).")
         Console.WriteLine()

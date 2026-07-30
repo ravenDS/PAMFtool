@@ -703,11 +703,17 @@ Public Class PamfFile
                 WriteWavHeader(w, kv.Value, lpcmCounts(kv.Key))
             Next
 
-            ' Patch ATRAC3plus RIFF headers (now that we know the frame count)
+            ' Patch ATRAC3plus RIFF headers (now that we know the frame count),
+            ' and append the atsc chunk (per-frame ATS extra_config_data) at EOF.
             For Each kv In at3Streams
                 Dim w As BinaryWriter = writers(kv.Key)
                 Dim s As PamfStreamInfo = kv.Value
                 Dim stripper As Atrac3PlusAuStripper = at3Strippers(kv.Key)
+                ' 1) trailer first (extends file to its final length), so the
+                '    RIFF size we write in the header actually matches on-disk.
+                w.BaseStream.Seek(0, SeekOrigin.End)
+                WriteAt3AtscTrailer(w, stripper)
+                ' 2) patch the fixed-size prefix (RIFF / fmt / fact / data-hdr)
                 w.BaseStream.Position = 0
                 WriteAt3RiffHeader(w, s, stripper)
                 Console.WriteLine($"     at3+ s{kv.Key:D2}: {stripper.FramesWritten} frames of {stripper.StrippedFrameSize} bytes " &
@@ -1051,16 +1057,15 @@ Public Class PamfFile
                                    s As PamfStreamInfo,
                                    stripper As Atrac3PlusAuStripper)
         ' write RIFF/WAVE file using WAVE_FORMAT_EXTENSIBLE with Sony ATRAC3plus SubFormat GUID
-
-        ' data chunk that follows carries 'frameCount', raw_data_frame blocks with ATS header stripped
+        '
+        ' data chunk that follows carries `frameCount` raw_data_frame blocks with ATS header stripped
         ' nBlockAlign = stripped size
-
+        '
         ' custom "atsc" chunk carries ATS extra_config_data (bytes 4-7 of ATS header)
+        ' stored per-frame (4 bytes per frame) so muxer can round-trip streams where extra_config_data varies frame-to-frame
         '
         ' SubFormat GUID for ATRAC3plus (little-endian):
         '   BFAA23E9-58CB-7144-A119-FFFA01E4CE62
-        '
-        ' total header size is Atrac3PlusAuStripper.At3RiffHeaderLen (=96 bytes).
 
         Dim channels As Integer = If(s.NumChannels > 0, CInt(s.NumChannels), 2)
         Dim sampleRate As Integer = If(s.SampleRate > 0, s.SampleRate, 48000)
@@ -1081,8 +1086,14 @@ Public Class PamfFile
         ' fmt chunk: 18 (base WAVEFORMATEX) + 22 (extension) = 40 bytes
         Dim fmtSize As Integer = 40
 
-        ' RIFF header (12) + fmt (8+40=48) + atsc (8+4=12) + fact (8+8=16) + data hdr (8) = 96 bytes of header before payload
-        Dim riffSize As Long = CLng(4 + 48 + 12 + 16 + 8) + dataBytes
+        ' trailing atsc chunk payload = frameCount * 4
+        ' chunk header (8 bytes) is included when it's present
+        ' frameCount == 0 means no atsc chunk at all, so no 8-byte header either
+        Dim atscPayload As Long = frameCount * 4L
+        Dim atscTotal As Long = If(atscPayload > 0, atscPayload + 8L, 0L)
+
+        ' RIFF header (12) + fmt (8+40=48) + fact (8+8=16) + data hdr (8) + data (dataBytes) + atsc trailer = full file
+        Dim riffSize As Long = CLng(4 + 48 + 16 + 8) + dataBytes + atscTotal
 
         ' KSAUDIO channel masks
         Dim mask As UInteger
@@ -1111,13 +1122,6 @@ Public Class PamfFile
         bw.Write(mask)
         bw.Write(guid)
 
-        ' "atsc" (ATS Config) chunk holding bytes 4-7 of the first ATS header
-        ' muxer reads it back to reconstruct a byte-accurate ATS header
-        ' if .at3 was made without this chunk we fall back to zeros there
-        bw.Write(Encoding.ASCII.GetBytes("atsc"))
-        bw.Write(CInt(4))
-        bw.Write(stripper.ExtraConfigData, 0, 4)
-
         bw.Write(Encoding.ASCII.GetBytes("fact"))
         bw.Write(CInt(8))
         bw.Write(CInt(samplesTot And &HFFFFFFFFL))
@@ -1125,6 +1129,19 @@ Public Class PamfFile
 
         bw.Write(Encoding.ASCII.GetBytes("data"))
         bw.Write(CUInt(Math.Min(dataBytes, &HFFFFFFFFL)))
+    End Sub
+
+    ' append the "atsc" chunk after the data chunk
+    ' payload = FramesWritten * 4 bytes
+    ' every 4-byte block is one frame's ATS extra_config_data in stream order
+    Private Sub WriteAt3AtscTrailer(bw As BinaryWriter, stripper As Atrac3PlusAuStripper)
+        Dim n As Long = stripper.FramesWritten
+        If n <= 0 Then Return
+        bw.Write(Encoding.ASCII.GetBytes("atsc"))
+        bw.Write(CInt(n * 4L))
+        For Each ec In stripper.PerFrameExtraConfig
+            bw.Write(ec, 0, 4)
+        Next
     End Sub
 
     ' -- Helpers --------------------------------------------------------------
@@ -1167,13 +1184,13 @@ Friend Class Atrac3PlusAuStripper
     Public Const SyncWord As Integer = &HFD0
     Public Const SamplesPerFrame As Integer = 2048
 
-    ' Header byte count produced by WriteAt3RiffHeader. ExtractAll reserves these bytes at the head of every at3+ output before demux
-    ' 12 bytes RIFF / size / WAVE
-    ' 48 bytes fmt  chunk header + 40-byte WAVEFORMATEXTENSIBLE payload
-    ' 12 bytes atsc chunk header + 4-byte payload (extra_config_data from ATS header)
-    ' 16 bytes fact chunk header + 8-byte payload
-    ' 8 bytes data chunk header
-    Public Const At3RiffHeaderLen As Integer = 96
+    ' Header byte count produced by WriteAt3RiffHeader. ExtractAll reserves these bytes at the head of every at3+ output before demux:
+    '   12 bytes RIFF / size / WAVE
+    '   48 bytes fmt  chunk header + 40-byte WAVEFORMATEXTENSIBLE payload
+    '   16 bytes fact chunk header + 8-byte payload
+    '    8 bytes data chunk header
+    ' the atsc chunk is written AFTER the data chunk so it can be variable-length (FramesWritten * 4 bytes of payload)
+    Public Const At3RiffHeaderLen As Integer = 84
 
     Private ReadOnly _bw As BinaryWriter
     Private _frameSize As Integer = 0     ' full frame size incl. ATS header, resolved from the first ATS we see
@@ -1181,8 +1198,7 @@ Friend Class Atrac3PlusAuStripper
     Private _sizeProbeFilled As Integer = 0
     Private _frame As Byte()              ' full-frame buffer (allocated once frameSize is known)
     Private _filled As Integer = 0
-    Private _extraConfig As Byte() = New Byte(3) {}   ' bytes 4-7 of first ATS header (downmix coefficients)
-    Private _extraConfigKnown As Boolean = False
+    Private ReadOnly _perFrameExtra As New List(Of Byte())()
     Public Property FramesWritten As Long
 
     ' StrippedFrameSize is 0 until first ATS header has been parsed
@@ -1193,11 +1209,13 @@ Friend Class Atrac3PlusAuStripper
         End Get
     End Property
 
-    ' bytes 4-7 of ATS header, downmix coefficients
-    ' stash them in custom "atsc" RIFF chunk so muxer can restore them
-    Public ReadOnly Property ExtraConfigData As Byte()
+    ' One 4-byte entry per emitted frame - the ATS header's bytes 4-7 for that
+    ' frame. Written out by the extractor as an "atsc" chunk of size
+    ' FramesWritten * 4 so the muxer can restore each frame's ATS header
+    ' byte-for-byte.
+    Public ReadOnly Property PerFrameExtraConfig As List(Of Byte())
         Get
-            Return _extraConfig
+            Return _perFrameExtra
         End Get
     End Property
 
@@ -1251,11 +1269,10 @@ Friend Class Atrac3PlusAuStripper
             p += take
             remain -= take
             If _filled = _frameSize Then
-                If Not _extraConfigKnown Then
-                    ' snapshot bytes 4-7 of ATS header for RIFF "atsc" chunk
-                    Buffer.BlockCopy(_frame, 4, _extraConfig, 0, 4)
-                    _extraConfigKnown = True
-                End If
+                ' snapshot THIS frame's bytes 4-7 (per-frame - not just the first)
+                Dim ec(3) As Byte
+                Buffer.BlockCopy(_frame, 4, ec, 0, 4)
+                _perFrameExtra.Add(ec)
                 _bw.Write(_frame, AtsHeaderSize, _frameSize - AtsHeaderSize)
                 FramesWritten += 1
                 _filled = 0
