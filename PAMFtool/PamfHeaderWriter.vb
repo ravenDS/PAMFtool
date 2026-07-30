@@ -160,6 +160,29 @@ Namespace PamfMux
             })
         End Sub
 
+        ' override the P-STD buffer size on the LAST-added AVC stream
+        ' used when the caller wants to match a reference file's exact buffer
+        ' no-op if the last stream is not AVC
+        Public Sub OverrideLastAvcPstd(kb As Integer)
+            For i As Integer = _streams.Count - 1 To 0 Step -1
+                If _streams(i).StreamTypeByte = &H1B Then
+                    _streams(i).PStdBufferRaw = CUShort((1 << 13) Or (kb And &H1FFF))
+                    Return
+                End If
+            Next
+        End Sub
+
+        ' override the max_mean_bitrate byte (codec_info[25]) on the last-added AVC stream
+        ' Sony encodes this per-file (11 for 1080p L4.1 CABAC, 5 for 720p L3.1 CAVLC) and some games may inspect it
+        Public Sub OverrideLastAvcMaxMeanBitrate(v As Byte)
+            For i As Integer = _streams.Count - 1 To 0 Step -1
+                If _streams(i).StreamTypeByte = &H1B Then
+                    _streams(i).CodecInfo(25) = v
+                    Return
+                End If
+            Next
+        End Sub
+
         Public Sub AddM2vStream(channel As Byte, pesStreamId As Byte,
                                 profileAndLevel As Byte, progressiveSeq As Byte,
                                 videoSignalInfoFlag As Byte, frameRateCode As Byte,
@@ -331,11 +354,10 @@ Namespace PamfMux
             For i As Integer = 0 To count - 1
                 Dim e As PamfMux.EpEntry = _epEntries(i)
                 Dim eo As Integer = epStart + i * 12
-                ' indexN encodes "this EP is the Nth IDR/keyframe" but bit pattern is just
-                ' (indexN - 1) << 14.
-                ' we don't track this precisely
-                ' use 1 (= bits 15:14 = 00)
-                WriteU16BE(_header, eo + 0, 0US)
+                ' writes bits 15:14 = 0b11 in value0 as a validity marker
+                ' bits 12:0 encode the sector offset from THIS RAP to the next non-RAP AU-start
+                ' we don't currently track that in the mux queue so we leave it at 0
+                WriteU16BE(_header, eo + 0, &HC000US)
                 WriteU16BE(_header, eo + 2, 0US)   ' pts_high
                 WriteU32BE(_header, eo + 4, CUInt(e.Pts And &HFFFFFFFFL))
                 Dim rpnSectors As ULong = CULng((e.ByteOffset And &HFFFFFFFFL) \ 2048L)

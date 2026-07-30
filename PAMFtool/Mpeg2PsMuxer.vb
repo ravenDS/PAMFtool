@@ -59,8 +59,11 @@ Namespace PamfMux
 
         ' Sony PAMF encodes use mux_rate_bound = 48 Mbps
         ' (0x1D4C0 in the PAMF sequence-info header, unit is 50 bytes/s so 120000 * 50 * 8 = 48000000)
-        ' the pack_header SCR increments at this same rate
+        ' this is the value written into the pack_header mux_rate field - the physical delivery capacity of the transport
         Public Property MuxRateBps As Integer = 48_000_000
+
+        ' rate at which SCR advances between packs, independent of MuxRateBps 
+        Public Property EffectiveDeliveryBps As Integer = 48_000_000
         ' Legacy: audio P-STD used for non-LPCM audio when a stream doesn't have its own.
         ' Video P-STD now lives per-stream on PamfMuxStream.PstdBufferSize.
         Public Property AudioPstdBufferSize As Integer = 20
@@ -158,6 +161,20 @@ Namespace PamfMux
                 Dim s As PamfMuxStream = PickNextStream()
                 If s Is Nothing Then Exit While
 
+                ' SCR pacing: when EffectiveDeliveryBps < MuxRateBps we want bytes to arrive on the playback timeline
+                ' we anchor SCR directly to the AU being emitted:
+                '
+                '  at every AU-start pack: SCR = max(prev+small, AU.DTS - lead)
+                '  between AU-starts:      SCR = prev + small  (fast advance)
+                '
+                ' buffer_lead = 90000 ticks (1 s) matches std_delay_bound
+                Dim pacing As Boolean = (EffectiveDeliveryBps > 0 AndAlso EffectiveDeliveryBps < MuxRateBps)
+                If pacing AndAlso Not _splitState.ContainsKey(s.Index) AndAlso s.AuQueue.Count > 0 Then
+                    Dim head As AccessUnit = s.AuQueue.Peek()
+                    Dim target As Long = head.Dts - PtsClockHz
+                    If target > scr Then scr = target
+                End If
+
                 Dim packStart As Long = output.Position
                 WritePackHeader(output, scr, 0, muxRateUnits)
 
@@ -182,7 +199,8 @@ Namespace PamfMux
 
                 EmitOnePesIntoSector(output, s, spaceLeft, packStart)
 
-                ' advance SCR by elapsed bytes at MuxRateBps
+                ' advance at MuxRateBps (fast, 30 ticks/pack)
+                ' if pacing is on, the AU-start jump above does the actual playback-alignment work
                 Dim packBytes As Long = output.Position - packStart
                 scr += (packBytes * PtsClockHz * 8L) \ MuxRateBps
                 If scr >= (1L << 33) Then scr -= (1L << 33)
@@ -406,21 +424,42 @@ Namespace PamfMux
                 End While
             End If
 
-            ' PES occupies entire sector remainder, size pes_packet_length accordingly and pad with 0xFF after data
+            ' size video PES to just the real AU content it carries
+            ' any leftover sector space goes into a separate padding_stream packet (0xBE)
+            Dim actualPayload As Integer = chunkLen + extrasBytes
+            Dim leftover As Integer = payloadFit - actualPayload
+            Dim pesPayloadLen As Integer
+            Dim inPesStuff As Integer
+            Dim emitPaddingStream As Boolean
+            Dim paddingStreamLen As Integer
+            If leftover >= 7 Then
+                pesPayloadLen = actualPayload
+                inPesStuff = 0
+                emitPaddingStream = True
+                paddingStreamLen = leftover
+            Else
+                pesPayloadLen = payloadFit
+                inPesStuff = leftover
+                emitPaddingStream = False
+                paddingStreamLen = 0
+            End If
+
             If isFirstChunk Then
-                WriteVideoPesHeader(out, s.PesStreamId, payloadFit, au.Pts, au.Dts,
+                WriteVideoPesHeader(out, s.PesStreamId, pesPayloadLen, au.Pts, au.Dts,
                                     s.PstdBufferSize)
             Else
-                WriteVideoPesHeaderContinuation(out, s.PesStreamId, payloadFit)
+                WriteVideoPesHeaderContinuation(out, s.PesStreamId, pesPayloadLen)
             End If
             out.Write(au.Data, consumed, chunkLen)
             For Each e In extras
                 out.Write(e.Data, 0, e.Data.Length)
             Next
-            Dim stuff As Integer = payloadFit - chunkLen - extrasBytes
-            For i As Integer = 0 To stuff - 1
+            For i As Integer = 0 To inPesStuff - 1
                 out.WriteByte(&HFF)
             Next
+            If emitPaddingStream Then
+                WritePaddingStream(out, paddingStreamLen)
+            End If
 
             If auFullyConsumed Then
                 s.AuQueue.Dequeue()

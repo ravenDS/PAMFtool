@@ -16,9 +16,12 @@ Friend Module PamfMuxRunner
                    noEp As Boolean,
                    forceDeblock As Boolean,
                    forceNoDeblock As Boolean,
-                   noAtsc As Boolean)
+                   noAtsc As Boolean,
+                   paceMbps As Double,
+                   overridePstdKb As Integer,
+                   overrideMmb As Integer)
         If positional.Count < 2 Then
-            Console.Error.WriteLine("Usage: PamfExtractor -mux <inputDir> <output.pamf> [-noep] [-noatsc] [-deblock | -nodeblock]")
+            Console.Error.WriteLine("Usage: PamfExtractor -mux <inputDir> <output.pamf> [-noep] [-noatsc] [-deblock | -nodeblock] [-pace <Mbps|auto|off>] [-pstd <KB>] [-mmb <n>]")
             Environment.Exit(1)
         End If
         Dim inDir As String = positional(0)
@@ -43,9 +46,19 @@ Friend Module PamfMuxRunner
         If forceDeblock Then Console.WriteLine("  -deblock: forcing deblock byte to 1")
         If forceNoDeblock Then Console.WriteLine("  -nodeblock: forcing deblock byte to 0")
         If noAtsc Then Console.WriteLine("  -noatsc: ATRAC3+ ATS extra_config_data forced to zero (ignores atsc chunk)")
+        If overridePstdKb > 0 Then Console.WriteLine($"  -pstd {overridePstdKb}: overriding AVC P-STD buffer size to {overridePstdKb} KB")
+        If overrideMmb >= 0 Then Console.WriteLine($"  -mmb {overrideMmb}: overriding max_mean_bitrate byte to {overrideMmb}")
+        If paceMbps > 0 Then
+            Console.WriteLine($"  -pace {paceMbps} Mbps: SCR pacing at fixed rate (mux_rate field stays 48 Mbps)")
+        ElseIf paceMbps < 0 Then
+            Console.WriteLine("  -pace off: SCR advances at mux_rate (legacy front-loaded delivery)")
+        Else
+            Console.WriteLine("  SCR pacing: auto (will match measured content bitrate)")
+        End If
 
         Console.WriteLine("Muxing to: " & outPath)
-        BuildPamfFromFiles(files, outPath, noEp, forceDeblock, forceNoDeblock, noAtsc)
+        BuildPamfFromFiles(files, outPath, noEp, forceDeblock, forceNoDeblock, noAtsc, paceMbps,
+                           overridePstdKb, overrideMmb)
         Dim sz As Long = New FileInfo(outPath).Length
         Console.WriteLine("Wrote " & outPath & " (" & sz.ToString("N0") & " bytes)")
     End Sub
@@ -101,14 +114,17 @@ Friend Module PamfMuxRunner
 
     Private Sub BuildPamfFromFiles(files As List(Of MuxInput), outPath As String,
                                    noEp As Boolean, forceDeblock As Boolean,
-                                   forceNoDeblock As Boolean, noAtsc As Boolean)
+                                   forceNoDeblock As Boolean, noAtsc As Boolean,
+                                   paceMbps As Double,
+                                   overridePstdKb As Integer,
+                                   overrideMmb As Integer)
         Dim mux As New PamfMuxer()
         mux.SkipEpTable = noEp
 
         ' for each input, parse codec metadata, register the stream, then slice into AUs and queue
         For Each f In files
             Select Case f.Kind
-                Case "avc" : RegisterAndQueueAvc(mux, f, forceDeblock, forceNoDeblock)
+                Case "avc" : RegisterAndQueueAvc(mux, f, forceDeblock, forceNoDeblock, overridePstdKb, overrideMmb)
                 Case "mpeg2" : RegisterAndQueueM2v(mux, f)
                 Case "atrac3plus" : RegisterAndQueueAt3p(mux, f, noAtsc)
                 Case "ac3" : RegisterAndQueueAc3(mux, f)
@@ -116,16 +132,63 @@ Friend Module PamfMuxRunner
             End Select
         Next
 
+        ' resolve the SCR pacing rate, 3 modes:
+        '  paceMbps > 0  : fixed user value (e.g. -pace 7 -> 7 Mbps)
+        '  paceMbps == 0 : "auto" - derive from measured content bitrate over playback duration
+        '  paceMbps < 0  : "off"  - advance SCR at mux_rate (legacy front-loaded delivery)
+        ' whatever we resolve here is passed to PsMuxer.EffectiveDeliveryBps
+        Dim effectiveBps As Integer
+        If paceMbps < 0 Then
+            effectiveBps = mux.PsMuxer.MuxRateBps
+        ElseIf paceMbps > 0 Then
+            effectiveBps = CInt(paceMbps * 1_000_000)
+        Else
+            effectiveBps = ComputeAutoPaceBps(mux)
+            Console.WriteLine($"  auto pace: {effectiveBps / 1_000_000.0:F2} Mbps (from measured content bitrate)")
+        End If
+        ' Clamp to a sensible floor - never pace slower than 1 Mbps or SCR span
+        ' explodes into the multi-hour range for short clips, and hardware may not
+        ' cope with unrealistic delivery clocks.
+        If effectiveBps < 1_000_000 Then effectiveBps = 1_000_000
+        If effectiveBps > mux.PsMuxer.MuxRateBps Then effectiveBps = mux.PsMuxer.MuxRateBps
+        mux.PsMuxer.EffectiveDeliveryBps = effectiveBps
+
         Using outFs As New FileStream(outPath, FileMode.Create, FileAccess.Write)
             mux.WritePamfFile(outFs)
         End Using
     End Sub
 
+    ' compute an SCR pacing rate
+    ' rate is derived from the QUEUED AU payload bytes divided by playback duration
+    Private Function ComputeAutoPaceBps(mux As PamfMuxer) As Integer
+        Dim totalPayloadBytes As Long = 0
+        Dim maxPts As Long = 0
+        Dim minPts As Long = Long.MaxValue
+        For Each s In mux.PsMuxer.Streams
+            For Each au In s.AuQueue
+                totalPayloadBytes += au.Data.LongLength
+                If au.Pts < minPts Then minPts = au.Pts
+                If au.Pts > maxPts Then maxPts = au.Pts
+            Next
+        Next
+        If maxPts <= minPts OrElse totalPayloadBytes <= 0 Then
+            Return mux.PsMuxer.MuxRateBps
+        End If
+        Dim durationSec As Double = (maxPts - minPts) / 90000.0
+        If durationSec <= 0.1 Then
+            Return mux.PsMuxer.MuxRateBps
+        End If
+        ' bytes per second from content alone, no overhead multiplier
+        Return CInt(Math.Ceiling((totalPayloadBytes * 8.0) / durationSec))
+    End Function
+
     ' AVC: parse SPS, slice into per-frame AU, generate PTS/DTS
 
     Private Sub RegisterAndQueueAvc(mux As PamfMuxer, f As MuxInput,
                                     forceDeblock As Boolean,
-                                    forceNoDeblock As Boolean)
+                                    forceNoDeblock As Boolean,
+                                    overridePstdKb As Integer,
+                                    overrideMmb As Integer)
         Dim bytes As Byte() = File.ReadAllBytes(f.Path)
         Dim sps As H264SpsInfo = H264SpsParser.ParseFirstSps(bytes, 0, bytes.Length)
         If sps Is Nothing Then
@@ -167,6 +230,15 @@ Friend Module PamfMuxRunner
             matrixCoeffs:=matrixCoeff,
             cabacFlag:=cabac,
             deblockFlag:=deblock)
+
+        ' apply user overrides
+        If overridePstdKb > 0 Then
+            ps.PstdBufferSize = overridePstdKb
+            mux.HeaderWriter.OverrideLastAvcPstd(overridePstdKb)
+        End If
+        If overrideMmb >= 0 Then
+            mux.HeaderWriter.OverrideLastAvcMaxMeanBitrate(CByte(overrideMmb And &HFF))
+        End If
 
         ' slice into per-frame AU at VCL NAL boundaries (types 1, 5)
         ' each AU starts at a NALU, ends just before the next VCL NALU
