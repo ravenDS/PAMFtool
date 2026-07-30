@@ -491,26 +491,74 @@ Friend Module PamfMuxRunner
         Return 4
     End Function
 
-    ' ATRAC3plus: read .at3 RIFF, re-add 8-byte PAMF prefix per frame
+    ' ATRAC3plus: read .at3 RIFF, rebuild 8-byte ATS header per frame
+    '
+    ' Each PAMF ATRAC3plus AU on the wire is:
+    ' [ 8-byte ATS header ] [ raw_data_frame ]
+
+    ' our extractor strips the ATS header and stores "extra_config_data" in custom "atsc" RIFF chunk so we can round-trip it here
+
+    ' if .at3 has no atsc chunk (older extract, or file produced by at3tool.exe / vgmstream) the extra_config_data falls back to 0
 
     Private Sub RegisterAndQueueAt3p(mux As PamfMuxer, f As MuxInput)
         Dim chs As Integer = 0
         Dim sr As Integer = 0
         Dim frameSize As Integer = 0
-        Dim frames As List(Of Byte()) = ReadAt3Frames(f.Path, chs, sr, frameSize)
+        Dim extraCfg(3) As Byte
+        Dim frames As List(Of Byte()) = ReadAt3Frames(f.Path, chs, sr, frameSize, extraCfg)
         Dim ps As PamfMuxStream = mux.AddAtrac3plusStream(numChannels:=CByte(chs))
+
+        ' ATS header params field layout:
+        '  [15:13]  sample_rate_idx  : 1 = 44100, 2 = 48000
+        '  [12:10]  ch_config_idx    : 1 = 1ch, 2 = 2ch, 5 = 6ch (5.1), 7 = 8ch (7.1)
+        '                              (3, 4, 6 = 3/4/7 channels; docs list 1/2/6/8 as the "official" set)
+        '  [9:0]    nbytes_encoded   : (raw_data_frame_size / 8) - 1
+        Dim srIdx As Integer
+        Select Case sr
+            Case 44100 : srIdx = 1
+            Case 48000 : srIdx = 2
+            Case Else
+                Throw New InvalidDataException(
+                    $"ATRAC3plus sample rate {sr} Hz is unsupported by PAMF (44100 / 48000 only).")
+        End Select
+
+        Dim chIdx As Integer
+        Select Case chs
+            Case 1 : chIdx = 1
+            Case 2 : chIdx = 2
+            Case 3 : chIdx = 3
+            Case 4 : chIdx = 4
+            Case 6 : chIdx = 5
+            Case 7 : chIdx = 6
+            Case 8 : chIdx = 7
+            Case Else
+                Throw New InvalidDataException(
+                    $"ATRAC3plus channel count {chs} isn't representable in an ATS header.")
+        End Select
+
+        If (frameSize Mod 8) <> 0 OrElse frameSize <= 0 OrElse frameSize > &H200 * 8 Then
+            Throw New InvalidDataException(
+                $"ATRAC3plus block_align {frameSize} out of range - must be a positive multiple of 8, at most 4096.")
+        End If
+        Dim nbytesEnc As Integer = (frameSize \ 8) - 1
+        Dim params As Integer = (srIdx << 13) Or (chIdx << 10) Or (nbytesEnc And &H3FF)
 
         ' one AU per frame, PTS spaced by samples-per-frame (2048) at sample rate converted to 90 kHz
         ' pts_step = 2048 * 90000 / sample_rate
-        Dim ptsStep As Long = CLng(2048L * 90000L \ CLng(If(sr > 0, sr, 48000)))
+        Dim ptsStep As Long = CLng(2048L * 90000L \ CLng(sr))
         Dim ptsBase As Long = 90000L
         For i As Integer = 0 To frames.Count - 1
             Dim raw As Byte() = frames(i)
-            ' build the 696-byte PAMF AU: 8-byte prefix + 688-byte frame
+            ' build the PAMF AU: 8-byte ATS header + raw_data_frame
             Dim pamfAu(8 + raw.Length - 1) As Byte
-            pamfAu(0) = &HF : pamfAu(1) = &HD0
-            pamfAu(2) = &H48 : pamfAu(3) = &H55
-            ' bytes 4..7 left as zero
+            pamfAu(0) = &HF                            ' sync high byte
+            pamfAu(1) = &HD0                           ' sync low byte
+            pamfAu(2) = CByte((params >> 8) And &HFF)  ' params high byte
+            pamfAu(3) = CByte(params And &HFF)         ' params low byte
+            pamfAu(4) = extraCfg(0)
+            pamfAu(5) = extraCfg(1)
+            pamfAu(6) = extraCfg(2)
+            pamfAu(7) = extraCfg(3)
             Array.Copy(raw, 0, pamfAu, 8, raw.Length)
             mux.QueueAu(ps, New AccessUnit() With {
                 .Data = pamfAu, .Pts = ptsBase + CLng(i) * ptsStep,
@@ -522,9 +570,12 @@ Friend Module PamfMuxRunner
 
     Private Function ReadAt3Frames(path As String, ByRef channels As Integer,
                                    ByRef sampleRate As Integer,
-                                   ByRef frameSize As Integer) As List(Of Byte())
-        ' parse the RIFF/WAVE-style .at3 file
-        ' (WAVE_FORMAT_EXTENSIBLE with Sony AT3+ GUID, blockAlign = 688).
+                                   ByRef frameSize As Integer,
+                                   ByRef extraConfigData As Byte()) As List(Of Byte())
+        ' parse RIFF/WAVE-style .at3 file:
+        '   WAVE_FORMAT_EXTENSIBLE (0xFFFE) with AT3+ SubFormat GUID
+        '   nBlockAlign = raw_data_frame size (ATS header stripped)
+        '   optional "atsc" chunk (4 bytes) carrying ATS extra_config_data
         Dim data As Byte() = File.ReadAllBytes(path)
         If data.Length < 12 Then Throw New InvalidDataException("Tiny .at3 file: " & path)
         If data(0) <> &H52 OrElse data(1) <> &H49 _
@@ -534,6 +585,7 @@ Friend Module PamfMuxRunner
         Dim pos As Integer = 12
         Dim dataOff As Integer = -1
         Dim dataLen As Integer = 0
+        Dim atscSeen As Boolean = False
         While pos < data.Length - 8
             Dim chunkId As String = System.Text.Encoding.ASCII.GetString(data, pos, 4)
             Dim chunkSize As Integer = BitConverter.ToInt32(data, pos + 4)
@@ -542,6 +594,12 @@ Friend Module PamfMuxRunner
                 channels = BitConverter.ToUInt16(data, pos + 8 + 2)
                 sampleRate = BitConverter.ToInt32(data, pos + 8 + 4)
                 frameSize = BitConverter.ToUInt16(data, pos + 8 + 12)
+            ElseIf chunkId = "atsc" Then
+                ' 4 bytes of ATS extra_config_data snapshotted at extract time
+                If chunkSize >= 4 Then
+                    Array.Copy(data, pos + 8, extraConfigData, 0, 4)
+                    atscSeen = True
+                End If
             ElseIf chunkId = "data" Then
                 dataOff = pos + 8
                 dataLen = chunkSize
@@ -552,6 +610,11 @@ Friend Module PamfMuxRunner
         End While
         If dataOff < 0 Then Throw New InvalidDataException("No data chunk in .at3: " & path)
         If frameSize <= 0 Then frameSize = 688
+        If Not atscSeen Then
+            ' older extracts and .at3 files from at3tool/vgmstream don't carry the ATS extra_config_data
+            ' zero is a safe default
+            Array.Clear(extraConfigData, 0, 4)
+        End If
 
         Dim frames As New List(Of Byte())()
         Dim n As Integer = dataLen \ frameSize
