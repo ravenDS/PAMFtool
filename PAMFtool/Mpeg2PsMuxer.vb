@@ -55,10 +55,11 @@ Namespace PamfMux
 
         Public Const PtsClockHz As Long = 90000L
         Public Const AudioLeadTicks As Long = 9000L
-        Public Const InitialScr As Long = 30030L
+        Public Const InitialScr As Long = 30L
 
-        ' Sony PAMF encodes use mux_rate bound of 48 Mbps (0x1D4C0 in the header)
-        ' the pack_header SCR increments at this rate too, so leaving it at 24 Mbps produces SCRs half as fast as Sony for identical content
+        ' Sony PAMF encodes use mux_rate_bound = 48 Mbps
+        ' (0x1D4C0 in the PAMF sequence-info header, unit is 50 bytes/s so 120000 * 50 * 8 = 48000000)
+        ' the pack_header SCR increments at this same rate
         Public Property MuxRateBps As Integer = 48_000_000
         ' Legacy: audio P-STD used for non-LPCM audio when a stream doesn't have its own.
         ' Video P-STD now lives per-stream on PamfMuxStream.PstdBufferSize.
@@ -374,7 +375,11 @@ Namespace PamfMux
                 })
             End If
 
-            Dim payloadFit As Integer = availBytes - VideoPesHeaderLen
+            ' AU-start PES carries PTS+DTS+P-STD (13-byte extension, total 22B header)
+            ' continuation PES carry no timestamps and no P-STD (0-byte extension, total 9B header)
+            ' see WriteVideoPesHeaderContinuation
+            Dim hdrLen As Integer = If(isFirstChunk, VideoPesHeaderLen, VideoPesHeaderContinuationLen)
+            Dim payloadFit As Integer = availBytes - hdrLen
             If payloadFit <= 0 Then
                 ' no room at all - fill bytes
                 For i As Integer = 0 To availBytes - 1
@@ -402,8 +407,12 @@ Namespace PamfMux
             End If
 
             ' PES occupies entire sector remainder, size pes_packet_length accordingly and pad with 0xFF after data
-            WriteVideoPesHeader(out, s.PesStreamId, payloadFit, au.Pts, au.Dts,
-                                s.PstdBufferSize)
+            If isFirstChunk Then
+                WriteVideoPesHeader(out, s.PesStreamId, payloadFit, au.Pts, au.Dts,
+                                    s.PstdBufferSize)
+            Else
+                WriteVideoPesHeaderContinuation(out, s.PesStreamId, payloadFit)
+            End If
             out.Write(au.Data, consumed, chunkLen)
             For Each e In extras
                 out.Write(e.Data, 0, e.Data.Length)

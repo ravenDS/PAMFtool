@@ -34,6 +34,10 @@ Namespace PamfMux
                                      Optional cabacFlag As Byte = 0,
                                      Optional deblockFlag As Byte = 0) As PamfMuxStream
             Dim ps As PamfMuxStream = PsMuxer.AddStream(PamfStreamType.AVC)
+            ' AddStream defaults AVC P-STD to 1505 KB (right for Level 3.1)
+            ' for higher-level streams the decoder needs a bigger input buffer or it underruns on complex frames
+            ' see AvcPstdKbForLevel
+            ps.PstdBufferSize = PamfHeaderWriter.AvcPstdKbForLevel(levelIdc)
             Dim widthMbs As Integer = (widthPx + 15) \ 16
             Dim heightMbs As Integer = (heightPx + 15) \ 16
             HeaderWriter.AddAvcStream(

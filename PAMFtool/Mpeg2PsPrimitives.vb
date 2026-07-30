@@ -20,6 +20,7 @@ Namespace PamfMux
         Public Const PackHeaderLen As Integer = 14
         Public Const SystemHeaderLen As Integer = 18
         Public Const VideoPesHeaderLen As Integer = 22
+        Public Const VideoPesHeaderContinuationLen As Integer = 9   ' see WriteVideoPesHeaderContinuation
         Public Const AudioPesHeaderLen As Integer = 21
         Public Const AudioSubHeaderLen As Integer = 4
 
@@ -137,6 +138,29 @@ Namespace PamfMux
             Dim sz As Integer = pstdBufferSize And &H1FFF
             out.WriteByte(CByte(&H40 Or &H20 Or ((sz >> 8) And &H1F)))
             out.WriteByte(CByte(sz And &HFF))
+        End Sub
+
+        ' continuation-only video PES header E
+        ' mitted for every video PES that carries the tail of an access unit rather than its start
+        ' only PES packets that actually begin a new AU carry PTS + DTS + P-STD,
+        ' and every subsequent split of the same AU uses the short 9-byte header below
+        ' (byte 6 = 0x81 marker + alignment, byte 7 = 0x00 no flags, byte 8 = 0x00 no header data)
+        Public Sub WriteVideoPesHeaderContinuation(out As Stream,
+                                                   streamId As Byte,
+                                                   payloadLen As Integer)
+            If streamId < &HE0 OrElse streamId > &HEF Then
+                Throw New ArgumentException("video PES requires streamId 0xE0..0xEF")
+            End If
+            Dim pesLen As Integer = 3 + payloadLen  ' bytes 6, 7, 8 + payload
+            If pesLen > &HFFFF Then
+                Throw New ArgumentOutOfRangeException(NameOf(payloadLen))
+            End If
+            out.WriteByte(0) : out.WriteByte(0) : out.WriteByte(1) : out.WriteByte(streamId)
+            out.WriteByte(CByte((pesLen >> 8) And &HFF))
+            out.WriteByte(CByte(pesLen And &HFF))
+            out.WriteByte(&H81)     ' byte 6: "10" marker + data_alignment_indicator
+            out.WriteByte(&H0)      ' byte 7: no PTS/DTS, no extensions
+            out.WriteByte(&H0)      ' byte 8: header_data_length = 0
         End Sub
 
         ' audio PES header (14 bytes including sub-hdr space, PTS only)

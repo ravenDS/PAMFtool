@@ -173,14 +173,16 @@ Friend Module PamfMuxRunner
         Dim auStarts As List(Of Integer) = FindAvcAuStarts(bytes)
         Dim tickPerFrame As Long = CLng(90000.0 / fps)
         Dim ptsBase As Long = 90000L
+        ' DTS lags PTS by exactly one frame
         For i As Integer = 0 To auStarts.Count - 1
             Dim s As Integer = auStarts(i)
             Dim e As Integer = If(i + 1 < auStarts.Count, auStarts(i + 1), bytes.Length)
             Dim au(e - s - 1) As Byte
             Array.Copy(bytes, s, au, 0, e - s)
             Dim pts As Long = ptsBase + CLng(i) * tickPerFrame
+            Dim dts As Long = pts - tickPerFrame
             mux.QueueAu(ps, New AccessUnit() With {
-                .Data = au, .Pts = pts, .Dts = pts,
+                .Data = au, .Pts = pts, .Dts = dts,
                 .IsRandomAccessPoint = AvcAuContainsIdr(au)
             })
         Next
@@ -454,11 +456,12 @@ Friend Module PamfMuxRunner
                 End While
 
                 Dim pts As Long = ptsBase + CLng(i) * tickPerFrame
+                Dim dts As Long = pts - tickPerFrame  ' one-frame reorder delay, see RegisterAndQueueAvc
                 ' RAP if this AU starts with sequence_header (0x000001B3)
                 Dim isRap As Boolean = picIsRap(i) OrElse (au.Length >= 4 AndAlso
                     au(0) = 0 AndAlso au(1) = 0 AndAlso au(2) = 1 AndAlso au(3) = &HB3)
                 mux.QueueAu(ps, New AccessUnit() With {
-                    .Data = au, .Pts = pts, .Dts = pts,
+                    .Data = au, .Pts = pts, .Dts = dts,
                     .IsRandomAccessPoint = isRap,
                     .VideoPictureIndex = i,
                     .VideoVbvDelay = picVbvs(i)
