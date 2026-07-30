@@ -374,7 +374,11 @@ Namespace PamfMux
                 })
             End If
 
-            Dim payloadFit As Integer = availBytes - VideoPesHeaderLen
+            ' AU-start PES carries PTS+DTS+P-STD (13-byte extension, total 22B header)
+            ' continuation PES carry no timestamps and no P-STD (0-byte extension, total 9B header)
+            ' see WriteVideoPesHeaderContinuation
+            Dim hdrLen As Integer = If(isFirstChunk, VideoPesHeaderLen, VideoPesHeaderContinuationLen)
+            Dim payloadFit As Integer = availBytes - hdrLen
             If payloadFit <= 0 Then
                 ' no room at all - fill bytes
                 For i As Integer = 0 To availBytes - 1
@@ -402,8 +406,12 @@ Namespace PamfMux
             End If
 
             ' PES occupies entire sector remainder, size pes_packet_length accordingly and pad with 0xFF after data
-            WriteVideoPesHeader(out, s.PesStreamId, payloadFit, au.Pts, au.Dts,
-                                s.PstdBufferSize)
+            If isFirstChunk Then
+                WriteVideoPesHeader(out, s.PesStreamId, payloadFit, au.Pts, au.Dts,
+                                    s.PstdBufferSize)
+            Else
+                WriteVideoPesHeaderContinuation(out, s.PesStreamId, payloadFit)
+            End If
             out.Write(au.Data, consumed, chunkLen)
             For Each e In extras
                 out.Write(e.Data, 0, e.Data.Length)
