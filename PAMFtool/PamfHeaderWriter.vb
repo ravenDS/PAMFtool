@@ -1,4 +1,4 @@
-' PamfHeaderWriter.vb - github.com/ravenDS/PAMFtool
+ï»¿' PamfHeaderWriter.vb - github.com/ravenDS/PAMFtool
 '
 ' Build 2 KB PAMF header
 '
@@ -70,14 +70,39 @@ Namespace PamfMux
         '   AVC 720p / 1080i : scale=1, size ~1505 (~1.5 MB)
         '   M2V 720p         : scale=1, size 264..1234 depending on encoder; Sony's own is ~546
         '   AT3+ / AC-3      : scale=1, size 20 (20 KB is plenty for ~256 kbps compressed audio)
-        '   LPCM             : scale=1, size 128 (~128 KB) — LPCM at 48 kHz stereo 16-bit is
-        '                      ~1.5 Mbps sustained, so the 20 KB generic-audio value is far undersized and can trip real-hardware P-STD enforcement.
-
+        '   LPCM             : scale=1, size 128 (~128 KB) LPCM at 48 kHz stereo 16-bit is ~1.5 Mbps sustained
         ' we use conservative defaults per codec
         Private Const PStdBufferAvc1080 As UShort = CUShort((1 << 13) Or 1505)   ' 0x25E1
         Private Const PStdBufferM2v As UShort = CUShort((1 << 13) Or 546)        ' 0x2222
         Private Const PStdBufferAudio As UShort = CUShort((1 << 13) Or 20)       ' 0x2014
         Private Const PStdBufferLpcm As UShort = CUShort((1 << 13) Or 128)       ' 0x2080
+
+        ' P-STD buffer size (in 1024-byte units) for a given AVC level
+        ' too small and complex frames stall the decoder mid-stream, too large is harmless surplus
+        '
+        ' values below come from observing reference PAMFs:
+        '   level 3.1 CAVLC (720p 30fps)  -> 1505 KB
+        '   level 4.1 CABAC (1080p 30)    -> 2482 KB
+        '   level 4.1 CABAC (1080p 24)    -> 3703 KB
+        ' Sony varies the L4.1 value based on peak-frame complexity per file, and we can't infer that from the SPS alone
+        ' we pick the LARGER Sony-observed L4.1 value (3703) as the default so both L4.1 files decode without underruns
+        Public Shared Function AvcPstdBufferRawForLevel(levelIdc As Byte) As UShort
+            Dim kb As Integer
+            Select Case CInt(levelIdc)
+                Case Is <= 31 : kb = 1505    '    level 3.1
+                Case 32 : kb = 1800          '    level 3.2
+                Case 40 : kb = 2000          '    level 4.0
+                Case 41 : kb = 3703          '    level 4.1
+                Case 42 : kb = 4500          '    level 4.2
+                Case Is <= 50 : kb = 6000    '    level 5.0
+                Case Else : kb = 8000        '    level 5.1 and above
+            End Select
+            Return CUShort((1 << 13) Or (kb And &H1FFF))
+        End Function
+
+        Public Shared Function AvcPstdKbForLevel(levelIdc As Byte) As Integer
+            Return CInt(AvcPstdBufferRawForLevel(levelIdc)) And &H1FFF
+        End Function
 
         Public Sub AddAvcStream(channel As Byte, pesStreamId As Byte,
                                 profileIdc As Byte, levelIdc As Byte,
@@ -130,7 +155,7 @@ Namespace PamfMux
             _streams.Add(New StreamEntry() With {
                 .StreamTypeByte = &H1B, .Channel = channel,
                 .PesStreamId = pesStreamId, .SubStreamId = 0,
-                .PStdBufferRaw = PStdBufferAvc1080,
+                .PStdBufferRaw = AvcPstdBufferRawForLevel(levelIdc),
                 .CodecInfo = ci
             })
         End Sub

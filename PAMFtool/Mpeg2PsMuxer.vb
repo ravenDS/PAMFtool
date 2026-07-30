@@ -55,10 +55,11 @@ Namespace PamfMux
 
         Public Const PtsClockHz As Long = 90000L
         Public Const AudioLeadTicks As Long = 9000L
-        Public Const InitialScr As Long = 30030L
+        Public Const InitialScr As Long = 30L
 
-        ' Sony PAMF encodes use mux_rate bound of 48 Mbps (0x1D4C0 in the header)
-        ' the pack_header SCR increments at this rate too, so leaving it at 24 Mbps produces SCRs half as fast as Sony for identical content
+        ' Sony PAMF encodes use mux_rate_bound = 48 Mbps
+        ' (0x1D4C0 in the PAMF sequence-info header, unit is 50 bytes/s so 120000 * 50 * 8 = 48000000)
+        ' the pack_header SCR increments at this same rate
         Public Property MuxRateBps As Integer = 48_000_000
         ' Legacy: audio P-STD used for non-LPCM audio when a stream doesn't have its own.
         ' Video P-STD now lives per-stream on PamfMuxStream.PstdBufferSize.
