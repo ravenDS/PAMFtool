@@ -31,6 +31,19 @@ Public Class H264SpsInfo
     Public Property TransferCharacteristics As Byte  ' 1 = BT.709
     Public Property MatrixCoefficients As Byte    ' 1 = BT.709
 
+    ' std_delay_bound is varying with peak video bit rate
+    ' (1.00 s if peak <= 30 Mbps, 0.75 s if > 30 Mbps).
+    ' peak comes from HRD when the encoder wrote a full VUI, otherwise callers fall back to conservative defaults
+    Public Property HasHrdParameters As Boolean
+    Public Property HrdPeakBitrateBps As Long    ' 0 if HRD absent
+
+    ' fields the slice-header parser needs
+    Public Property Log2MaxFrameNumMinus4 As Byte
+    Public Property PicOrderCntType As Byte
+    Public Property Log2MaxPicOrderCntLsbMinus4 As Byte
+    Public Property DeltaPicOrderAlwaysZeroFlag As Boolean
+    Public Property SeparateColourPlaneFlag As Boolean
+
     Public ReadOnly Property FrameRate As Double
         Get
             If Not HasVuiTiming OrElse NumUnitsInTick = 0 Then Return 0.0
@@ -131,7 +144,9 @@ Friend Module H264SpsParser
         OrElse sps.ProfileIdc = 139 OrElse sps.ProfileIdc = 134 _
         OrElse sps.ProfileIdc = 135 Then
             Dim chromaFormatIdc As UInteger = br.Ue()
-            If chromaFormatIdc = 3UI Then br.U(1)             ' separate_colour_plane_flag
+            If chromaFormatIdc = 3UI Then
+                sps.SeparateColourPlaneFlag = (br.U(1) <> 0UI)             ' separate_colour_plane_flag
+            End If
             br.Ue()                                           ' bit_depth_luma_minus8
             br.Ue()                                           ' bit_depth_chroma_minus8
             br.U(1)                                           ' qpprime_y_zero_transform_bypass_flag
@@ -142,17 +157,18 @@ Friend Module H264SpsParser
             End If
         End If
 
-        br.Ue()                                               ' log2_max_frame_num_minus4
+        sps.Log2MaxFrameNumMinus4 = CByte(br.Ue() And &HFUI)      ' log2_max_frame_num_minus4
         Dim picOrderCntType As UInteger = br.Ue()
+        sps.PicOrderCntType = CByte(picOrderCntType And &HFFUI)
         If picOrderCntType = 0UI Then
-            br.Ue()                                           ' log2_max_pic_order_cnt_lsb_minus4
+            sps.Log2MaxPicOrderCntLsbMinus4 = CByte(br.Ue() And &HFUI)   ' log2_max_pic_order_cnt_lsb_minus4
         ElseIf picOrderCntType = 1UI Then
-            br.U(1)                                           ' delta_pic_order_always_zero_flag
-            br.Se()                                           ' offset_for_non_ref_pic
-            br.Se()                                           ' offset_for_top_to_bottom_field
-            Dim numRefInPicOrder As UInteger = br.Ue()        ' num_ref_frames_in_pic_order_cnt_cycle
+            sps.DeltaPicOrderAlwaysZeroFlag = (br.U(1) <> 0UI)   ' delta_pic_order_always_zero_flag
+            br.Se()                                              ' offset_for_non_ref_pic
+            br.Se()                                              ' offset_for_top_to_bottom_field
+            Dim numRefInPicOrder As UInteger = br.Ue()           ' num_ref_frames_in_pic_order_cnt_cycle
             For i As Integer = 0 To CInt(numRefInPicOrder) - 1
-                br.Se()                                       ' offset_for_ref_frame(i)
+                br.Se()                                          ' offset_for_ref_frame(i)
             Next
         End If
 
@@ -225,7 +241,41 @@ Friend Module H264SpsParser
             sps.FixedFrameRate = (br.U(1) <> 0UI)
         End If
 
+        ' HRD parameters
+        ' we only need the peak bitrate so we skip cpb sizes and cbr flags
+        Dim nalHrdPresent As Boolean = (br.U(1) <> 0UI)
+        Dim peakBps As Long = 0
+        If nalHrdPresent Then peakBps = Math.Max(peakBps, ParseHrdParameters(br))
+        Dim vclHrdPresent As Boolean = (br.U(1) <> 0UI)
+        If vclHrdPresent Then peakBps = Math.Max(peakBps, ParseHrdParameters(br))
+        If nalHrdPresent OrElse vclHrdPresent Then
+            sps.HasHrdParameters = True
+            sps.HrdPeakBitrateBps = peakBps
+        End If
+
         Return sps
+    End Function
+
+    ' parse hrd_parameters() and return the peak bitrate across all schedSelIdx
+    ' peak formula:
+    ' bitRate[i] = (bit_rate_value_minus1[i] + 1)* 2^(6 + bit_rate_scale) bps
+    Private Function ParseHrdParameters(br As BitReader) As Long
+        Dim cpbCntMinus1 As UInteger = br.Ue()
+        Dim bitRateScale As UInteger = br.U(4)
+        Dim cpbSizeScale As UInteger = br.U(4)
+        Dim maxBps As Long = 0
+        For i As UInteger = 0UI To cpbCntMinus1
+            Dim brValue As UInteger = br.Ue()  ' bit_rate_value_minus1[i]
+            Dim cpbSize As UInteger = br.Ue()  ' cpb_size_value_minus1[i] (unused)
+            br.U(1)                            ' cbr_flag[i] (unused)
+            Dim bps As Long = CLng(brValue + 1UI) << CInt(6 + bitRateScale)
+            If bps > maxBps Then maxBps = bps
+        Next
+        br.U(5)     ' initial_cpb_removal_delay_length_minus1
+        br.U(5)     ' cpb_removal_delay_length_minus1
+        br.U(5)     ' dpb_output_delay_length_minus1
+        br.U(5)     ' time_offset_length
+        Return maxBps
     End Function
 
     Private Class BitReader
@@ -277,6 +327,13 @@ End Module
 Public Class H264PpsInfo
     Public Property CabacFlag As Boolean
     Public Property DeblockingFilterControlPresent As Boolean
+    ' fields the slice-header parser needs
+    Public Property BottomFieldPicOrderInFramePresentFlag As Boolean
+    Public Property NumRefIdxL0DefaultActiveMinus1 As Byte
+    Public Property NumRefIdxL1DefaultActiveMinus1 As Byte
+    Public Property WeightedPredFlag As Boolean
+    Public Property WeightedBipredIdc As Byte    ' 0..3
+    Public Property RedundantPicCntPresentFlag As Boolean
 End Class
 
 Friend Module H264PpsParser
@@ -352,7 +409,7 @@ Friend Module H264PpsParser
         br.Ue()    ' pic_parameter_set_id
         br.Ue()    ' seq_parameter_set_id
         pps.CabacFlag = (br.U(1) <> 0UI)              ' entropy_coding_mode_flag
-        br.U(1)    ' bottom_field_pic_order_in_frame_present_flag
+        pps.BottomFieldPicOrderInFramePresentFlag = (br.U(1) <> 0UI)
 
         Dim numSliceGroupsMinus1 As UInteger = br.Ue()
         If numSliceGroupsMinus1 > 0UI Then
@@ -388,15 +445,17 @@ Friend Module H264PpsParser
             End Select
         End If
 
-        br.Ue()    ' num_ref_idx_l0_default_active_minus1
-        br.Ue()    ' num_ref_idx_l1_default_active_minus1
-        br.U(1)    ' weighted_pred_flag
-        br.U(2)    ' weighted_bipred_idc
+        pps.NumRefIdxL0DefaultActiveMinus1 = CByte(br.Ue() And &H3FUI)
+        pps.NumRefIdxL1DefaultActiveMinus1 = CByte(br.Ue() And &H3FUI)
+        pps.WeightedPredFlag = (br.U(1) <> 0UI)
+        pps.WeightedBipredIdc = CByte(br.U(2) And 3UI)
         br.Se()    ' pic_init_qp_minus26
         br.Se()    ' pic_init_qs_minus26
         br.Se()    ' chroma_qp_index_offset
 
         pps.DeblockingFilterControlPresent = (br.U(1) <> 0UI)
+        br.U(1)    ' constrained_intra_pred_flag
+        pps.RedundantPicCntPresentFlag = (br.U(1) <> 0UI)
         Return pps
     End Function
 
