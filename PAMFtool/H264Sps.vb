@@ -30,6 +30,10 @@ Public Class H264SpsInfo
     Public Property ColourPrimaries As Byte    ' 1 = BT.709
     Public Property TransferCharacteristics As Byte  ' 1 = BT.709
     Public Property MatrixCoefficients As Byte    ' 1 = BT.709
+
+    ' std_delay_bound is varying with peak video bit rate
+    ' (1.00 s if peak <= 30 Mbps, 0.75 s if > 30 Mbps).
+    ' peak comes from HRD when the encoder wrote a full VUI, otherwise callers fall back to conservative defaults
     Public Property HasHrdParameters As Boolean
     Public Property HrdPeakBitrateBps As Long    ' 0 if HRD absent
 

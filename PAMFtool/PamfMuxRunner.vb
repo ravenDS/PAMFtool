@@ -22,7 +22,8 @@ Friend Module PamfMuxRunner
                    overrideMmb As Integer,
                    ps2FramesPerBlock As Integer,
                    overrideMuxRateBps As Integer,
-                   overrideStdDelayTicks As Integer)
+                   overrideStdDelayTicks As Integer,
+                   overrideInitialScr As Long)
         If positional.Count < 2 Then
             Console.Error.WriteLine("Usage: PamfExtractor -mux <inputDir> <output.pamf> [-noep] [-noatsc] [-deblock | -nodeblock] [-pace <Mbps|auto|off>] [-pstd <KB>] [-mmb <n>] [-ps2-block <N>] [-muxrate <kbps>]")
             Environment.Exit(1)
@@ -52,6 +53,7 @@ Friend Module PamfMuxRunner
         If overridePstdKb > 0 Then Console.WriteLine($"  -pstd {overridePstdKb}: overriding AVC P-STD buffer size to {overridePstdKb} KB")
         If overrideMmb >= 0 Then Console.WriteLine($"  -mmb {overrideMmb}: overriding max_mean_bitrate byte to {overrideMmb}")
         If overrideMuxRateBps > 0 Then Console.WriteLine($"  -muxrate {overrideMuxRateBps \ 1000} kbps: overriding pack_header mux_rate (Sony spec: 48000/24000/12000)")
+        If overrideInitialScr >= 0 Then Console.WriteLine($"  -initial-scr {overrideInitialScr}: SCR at pack 0 (Sony uses 30 for logos, 30030 for game content)")
         If ps2FramesPerBlock = 0 Then
             Console.WriteLine("  -ps2-block 0: emitting legacy 4-byte ps2 marker at every IDR")
         ElseIf ps2FramesPerBlock < 0 Then
@@ -70,7 +72,7 @@ Friend Module PamfMuxRunner
         Console.WriteLine("Muxing to: " & outPath)
         BuildPamfFromFiles(files, outPath, noEp, forceDeblock, forceNoDeblock, noAtsc, paceMbps,
                            overridePstdKb, overrideMmb, ps2FramesPerBlock, overrideMuxRateBps,
-                           overrideStdDelayTicks)
+                           overrideStdDelayTicks, overrideInitialScr)
         Dim sz As Long = New FileInfo(outPath).Length
         Console.WriteLine("Wrote " & outPath & " (" & sz.ToString("N0") & " bytes)")
     End Sub
@@ -132,7 +134,8 @@ Friend Module PamfMuxRunner
                                    overrideMmb As Integer,
                                    ps2FramesPerBlock As Integer,
                                    overrideMuxRateBps As Integer,
-                                   overrideStdDelayTicks As Integer)
+                                   overrideStdDelayTicks As Integer,
+                                   overrideInitialScr As Long)
         Dim mux As New PamfMuxer()
         mux.SkipEpTable = noEp
         mux.PsMuxer.Ps2FramesPerBlock = ps2FramesPerBlock
@@ -147,12 +150,17 @@ Friend Module PamfMuxRunner
             ' inside RegisterAndQueueAvc.
             mux.StdDelayBoundTicks = overrideStdDelayTicks
         End If
+        If overrideInitialScr >= 0L Then
+            mux.PsMuxer.InitialScr = overrideInitialScr
+        End If
+
+        Dim userSetInitialScr As Boolean = (overrideInitialScr >= 0L)
 
         ' for each input, parse codec metadata, register the stream, then slice into AUs and queue
         For Each f In files
             Select Case f.Kind
-                Case "avc" : RegisterAndQueueAvc(mux, f, forceDeblock, forceNoDeblock, overridePstdKb, overrideMmb)
-                Case "mpeg2" : RegisterAndQueueM2v(mux, f)
+                Case "avc" : RegisterAndQueueAvc(mux, f, forceDeblock, forceNoDeblock, overridePstdKb, overrideMmb, userSetInitialScr)
+                Case "mpeg2" : RegisterAndQueueM2v(mux, f, userSetInitialScr)
                 Case "atrac3plus" : RegisterAndQueueAt3p(mux, f, noAtsc)
                 Case "ac3" : RegisterAndQueueAc3(mux, f)
                 Case "lpcm" : RegisterAndQueueLpcm(mux, f)
@@ -215,7 +223,8 @@ Friend Module PamfMuxRunner
                                     forceDeblock As Boolean,
                                     forceNoDeblock As Boolean,
                                     overridePstdKb As Integer,
-                                    overrideMmb As Integer)
+                                    overrideMmb As Integer,
+                                    userSetInitialScr As Boolean)
         Dim bytes As Byte() = File.ReadAllBytes(f.Path)
         Dim sps As H264SpsInfo = H264SpsParser.ParseFirstSps(bytes, 0, bytes.Length)
         If sps Is Nothing Then
@@ -264,6 +273,23 @@ Friend Module PamfMuxRunner
                 mux.PsMuxer.Ps2FramesPerBlock = 12
                 Console.WriteLine("  ps2 block N: could not detect SPS cadence, defaulting to 12")
             End If
+        End If
+
+        ' auto-detect InitialScr (SCR value at pack 0) from AVC profile
+        ' AVC High profile varies but 30 is verified in byte-identical files
+        ' so High profile keeps 30 unconditionally
+        If Not userSetInitialScr Then
+            Dim isHighProfileFamily As Boolean =
+                sps.ProfileIdc = 100 OrElse sps.ProfileIdc = 110 OrElse sps.ProfileIdc = 122 OrElse
+                sps.ProfileIdc = 244 OrElse sps.ProfileIdc = 44 OrElse sps.ProfileIdc = 83 OrElse
+                sps.ProfileIdc = 86 OrElse sps.ProfileIdc = 118 OrElse sps.ProfileIdc = 128 OrElse
+                sps.ProfileIdc = 138 OrElse sps.ProfileIdc = 139 OrElse sps.ProfileIdc = 134 OrElse
+                sps.ProfileIdc = 135
+            If Not isHighProfileFamily Then
+                mux.PsMuxer.InitialScr = 30030L
+                Console.WriteLine("  AVC Main/Baseline/Extended profile detected -> InitialScr = 30030 (Sony's game-content SCR0 policy)")
+            End If
+            ' High profile: leave InitialScr at whatever it already is (30 by default)
         End If
         ' default max_mean_bitrate byte
         ' observed values:
@@ -733,7 +759,7 @@ Friend Module PamfMuxRunner
     '   pass 1: scan sequentially, picture_start_code offset (Int64), sequence_header offset (for RAP marking), and vbv_delay
     '   pass 2: seek to each picture, read into per-picture Byte(), queue as AccessUnit
 
-    Private Sub RegisterAndQueueM2v(mux As PamfMuxer, f As MuxInput)
+    Private Sub RegisterAndQueueM2v(mux As PamfMuxer, f As MuxInput, userSetInitialScr As Boolean)
         ' 1) peek at file head to parse the first sequence_header
         Dim fi As New FileInfo(f.Path)
         Dim fileLen As Long = fi.Length
@@ -754,6 +780,12 @@ Friend Module PamfMuxRunner
         End If
         Dim fps As Double = seq.FrameRate
         If fps <= 0.0 Then fps = 30000.0 / 1001.0
+
+        ' auto-detect InitialScr for M2V, unless override
+        ' every M2V reference so faruses SCR0=30030
+        If Not userSetInitialScr Then
+            mux.PsMuxer.InitialScr = 30030L
+        End If
 
         Dim frameRateCode As Byte = M2vFrameRateCodeFromFps(fps)
         Dim prog As Byte = CByte(If(seq.ProgressiveSequence, 1, 0))

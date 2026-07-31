@@ -74,7 +74,23 @@ Namespace PamfMux
 
         Public Const PtsClockHz As Long = 90000L
         Public Const AudioLeadTicks As Long = 9000L
-        Public Const InitialScr As Long = 30L
+
+        ' SCR value written into pack 0 header, in 90 kHz ticks
+        ' encoder uses one of 2 distinct initial-SCR policies 
+        '
+        ' InitialScr = 30     ->  1.00 sec pre-roll: SCR0 is nearly zero and video PTS0 is 90000
+        '                          giving the decoder the full std_delay buffer time to fill before first playback
+        '
+        ' InitialScr = 30030  ->  0.67 sec pre-roll": SCR0 = 30030, giving ~60000- ticks of lead
+        '                          this is Sony's default for game content
+        '
+        ' choice affects the SCR-urgency picker:
+        ' - with 30030, first-audio urgency at pack 0 goes past-due immediately
+        ' - with 30, first-audio doesn't come due until pack ~102
+        '
+        ' kept as 30 for now 
+        ' users targeting game-style content should set 30030 via -initial-scr CLI flag
+        Public Property InitialScr As Long = 30L
 
         ' PAMF only accept these rates:
         '   48000 kbps   (default, used by most PAMFs)
@@ -222,7 +238,7 @@ Namespace PamfMux
                 '
                 ' at the start of a new AU (not mid-split), we anchor:
                 '   video AU: SCR = max(current, AU.DTS - std_delay_bound)         (90000 = 1 second target lead)
-                '                                            
+                '
                 '   audio AU: SCR = max(current, AU.PTS - AudioTargetLeadTicks)    (82306)
                 '                                            
                 ' at pack 0 the anchor produces a negative target so SCR stays at 30

@@ -35,6 +35,9 @@ Module Program
         ' -std-delay <ticks> : override std_delay_bound
         '                      0 = auto (default 90000 or 67500 based on AVC HRD peak)
         Dim overrideStdDelayTicks As Integer = 0
+        ' -initial-scr <ticks> : SCR value at pack 0, Sony uses either 30 or 30030 ("game" style, 0.67 s pre-roll)
+        '                        use 30030 for game-content files where Sony schedules audio bursts at packs 1/4/10
+        Dim overrideInitialScr As Long = -1L
         Dim i As Integer = 0
         While i < args.Length
             Dim a As String = args(i)
@@ -110,6 +113,18 @@ Module Program
                     End If
                     overrideStdDelayTicks = v
                     i += 1
+                Case "-initial-scr", "--initial-scr", "/initial-scr"
+                    Dim v As Long
+                    If i + 1 >= args.Length OrElse Not Long.TryParse(args(i + 1), v) Then
+                        Console.Error.WriteLine("Error: -initial-scr requires a value in 90 kHz ticks (typical 30 or 30030).")
+                        Environment.Exit(1)
+                    End If
+                    If v < 0L OrElse v > 90000L Then
+                        Console.Error.WriteLine("Error: -initial-scr out of range (must be 0..90000).")
+                        Environment.Exit(1)
+                    End If
+                    overrideInitialScr = v
+                    i += 1
                 Case "-h", "--help", "/?", "/h", "-?"
                     PrintUsage() : Return
                 Case Else : positional.Add(a)
@@ -142,7 +157,7 @@ Module Program
             End If
             PamfMuxRunner.Run(positional, noEp, forceDeblock, forceNoDeblock, noAtsc, paceMbps,
                               overridePstdKb, overrideMmb, ps2FramesPerBlock, overrideMuxRateBps,
-                              overrideStdDelayTicks)
+                              overrideStdDelayTicks, overrideInitialScr)
             Return
         End If
 
@@ -183,13 +198,15 @@ Module Program
         Console.WriteLine("  -pstd <KB>       Override AVC P-STD buffer size in KB (1..8191).")
         Console.WriteLine("                      Default is per-level (1505 for L3.1, 3703 for L4.1, etc).")
         Console.WriteLine("  -mmb <n>         Override max_mean_bitrate byte in AVC codec_info (0..255).")
-        Console.WriteLine("                      Sony encodes 11 for 1080p L4.1 CABAC, 5 for 720p L3.1 CAVLC.")
+        Console.WriteLine("                      Usually 11 for 1080p L4.1 CABAC, 5 for 720p L3.1 CAVLC.")
         Console.WriteLine("  -ps2-block <N>   private_stream_2 marker cadence in AUs.")
         Console.WriteLine("  -muxrate <kbps>  Override pack_header mux_rate. Per Sony PAMF Tools spec,")
         Console.WriteLine("                      48000 (default), 24000, or 12000 are valid.")
         Console.WriteLine("  -std-delay <tk>  Override std_delay_bound (u32 at header 0x66).")
         Console.WriteLine("                      90000 (1.00 s) when peak <= 30 Mbps")
-        Console.WriteLine("                      67500 (0.75 s) when > 30 Mbps. Auto-detected from AVC HRD.")
+        Console.WriteLine("                      67500 (0.75 s) when > 30 Mbps. Auto-detected from AVC HRD")
+        Console.WriteLine("  -initial-scr <tk>  Override SCR value at pack 0 (auto-detected)")
+        Console.WriteLine("                     default: 30 for AVC High profile, 30030 for AVC Main/M2V")
         Console.WriteLine()
         Console.WriteLine("Additional parameters:")
         Console.WriteLine("  -info       Print info on PAMF file & streams.")
