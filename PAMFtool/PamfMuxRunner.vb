@@ -20,9 +20,11 @@ Friend Module PamfMuxRunner
                    paceMbps As Double,
                    overridePstdKb As Integer,
                    overrideMmb As Integer,
-                   ps2FramesPerBlock As Integer)
+                   ps2FramesPerBlock As Integer,
+                   overrideMuxRateBps As Integer,
+                   overrideStdDelayTicks As Integer)
         If positional.Count < 2 Then
-            Console.Error.WriteLine("Usage: PamfExtractor -mux <inputDir> <output.pamf> [-noep] [-noatsc] [-deblock | -nodeblock] [-pace <Mbps|auto|off>] [-pstd <KB>] [-mmb <n>] [-ps2-block <N>]")
+            Console.Error.WriteLine("Usage: PamfExtractor -mux <inputDir> <output.pamf> [-noep] [-noatsc] [-deblock | -nodeblock] [-pace <Mbps|auto|off>] [-pstd <KB>] [-mmb <n>] [-ps2-block <N>] [-muxrate <kbps>]")
             Environment.Exit(1)
         End If
         Dim inDir As String = positional(0)
@@ -49,22 +51,26 @@ Friend Module PamfMuxRunner
         If noAtsc Then Console.WriteLine("  -noatsc: ATRAC3+ ATS extra_config_data forced to zero (ignores atsc chunk)")
         If overridePstdKb > 0 Then Console.WriteLine($"  -pstd {overridePstdKb}: overriding AVC P-STD buffer size to {overridePstdKb} KB")
         If overrideMmb >= 0 Then Console.WriteLine($"  -mmb {overrideMmb}: overriding max_mean_bitrate byte to {overrideMmb}")
+        If overrideMuxRateBps > 0 Then Console.WriteLine($"  -muxrate {overrideMuxRateBps \ 1000} kbps: overriding pack_header mux_rate (Sony spec: 48000/24000/12000)")
         If ps2FramesPerBlock = 0 Then
             Console.WriteLine("  -ps2-block 0: emitting legacy 4-byte ps2 marker at every IDR")
+        ElseIf ps2FramesPerBlock < 0 Then
+            Console.WriteLine("  ps2 block N: auto-detect from AVC SPS interval (fallback 12)")
         Else
             Console.WriteLine($"  ps2 cadence: {ps2FramesPerBlock}-frame block, {18 + 4 * ps2FramesPerBlock}-byte payload every {ps2FramesPerBlock} AUs")
         End If
         If paceMbps > 0 Then
-            Console.WriteLine($"  -pace {paceMbps} Mbps: SCR pacing at fixed rate (mux_rate field stays 48 Mbps)")
+            Console.WriteLine($"  -pace {paceMbps} Mbps: SCR pacing at fixed rate (mux_rate field unchanged)")
         ElseIf paceMbps < 0 Then
-            Console.WriteLine("  -pace off: SCR advances at mux_rate (legacy front-loaded delivery)")
+            Console.WriteLine("  -pace off (default): SCR advances at mux_rate")
         Else
-            Console.WriteLine("  SCR pacing: auto (will match measured content bitrate)")
+            Console.WriteLine("  -pace auto: SCR pacing derived from measured content bitrate")
         End If
 
         Console.WriteLine("Muxing to: " & outPath)
         BuildPamfFromFiles(files, outPath, noEp, forceDeblock, forceNoDeblock, noAtsc, paceMbps,
-                           overridePstdKb, overrideMmb, ps2FramesPerBlock)
+                           overridePstdKb, overrideMmb, ps2FramesPerBlock, overrideMuxRateBps,
+                           overrideStdDelayTicks)
         Dim sz As Long = New FileInfo(outPath).Length
         Console.WriteLine("Wrote " & outPath & " (" & sz.ToString("N0") & " bytes)")
     End Sub
@@ -124,10 +130,23 @@ Friend Module PamfMuxRunner
                                    paceMbps As Double,
                                    overridePstdKb As Integer,
                                    overrideMmb As Integer,
-                                   ps2FramesPerBlock As Integer)
+                                   ps2FramesPerBlock As Integer,
+                                   overrideMuxRateBps As Integer,
+                                   overrideStdDelayTicks As Integer)
         Dim mux As New PamfMuxer()
         mux.SkipEpTable = noEp
         mux.PsMuxer.Ps2FramesPerBlock = ps2FramesPerBlock
+        If overrideMuxRateBps > 0 Then
+            mux.PsMuxer.MuxRateBps = overrideMuxRateBps
+            ' Also default EffectiveDeliveryBps to the same so SCR advances match the
+            ' new mux_rate unless the user separately specifies -pace.
+            mux.PsMuxer.EffectiveDeliveryBps = overrideMuxRateBps
+        End If
+        If overrideStdDelayTicks > 0 Then
+            ' User-supplied override wins over any HRD-based auto-detect that happens
+            ' inside RegisterAndQueueAvc.
+            mux.StdDelayBoundTicks = overrideStdDelayTicks
+        End If
 
         ' for each input, parse codec metadata, register the stream, then slice into AUs and queue
         For Each f In files
@@ -217,9 +236,43 @@ Friend Module PamfMuxRunner
         Dim transferCh As Byte = If(sps.TransferCharacteristics > 0, sps.TransferCharacteristics, CByte(1))
         Dim matrixCoeff As Byte = If(sps.MatrixCoefficients > 0, sps.MatrixCoefficients, CByte(1))
         Dim cabac As Byte = If(pps IsNot Nothing AndAlso pps.CabacFlag, CByte(1), CByte(0))
-        Dim deblock As Byte = If(pps IsNot Nothing AndAlso pps.DeblockingFilterControlPresent, CByte(1), CByte(0))
+        ' PAMF codec_info deblockingFilterFlag byte reports whether stream uses in-loop deblocking filter
+        ' try to read from first slice, fall back to 0 if we can't
+        Dim deblock As Byte = InferAvcDeblockFilterEnabled(bytes, sps, pps)
         If forceDeblock Then deblock = 1
         If forceNoDeblock Then deblock = 0
+
+        ' adaptive std_delay
+        ' - if SPS carried HRD parameters, we know the encoder-declared peak bit rate
+        ' - absent HRD, keep the safe default 90000 (1 s)
+        If sps.HasHrdParameters AndAlso mux.StdDelayBoundTicks = 90000 Then
+            If sps.HrdPeakBitrateBps > 30_000_000L Then
+                mux.StdDelayBoundTicks = 67500
+                Console.WriteLine($"  AVC HRD peak bit rate {sps.HrdPeakBitrateBps / 1_000_000.0:F1} Mbps > 30 Mbps -> std_delay = 0.75 s (67500 ticks) per Sony spec")
+            End If
+        End If
+
+        ' auto-detect ps2 block N from SPS interval when user didn't pass -ps2-block
+        ' Sony inserts SPS at each seek-block boundary and ps2 marker N field matches that interval
+        ' fall back to 12 if stream doesn't have consistent SPS cadence
+        If mux.PsMuxer.Ps2FramesPerBlock < 0 Then
+            Dim detected As Integer = DetectAvcSpsInterval(bytes)
+            If detected > 0 Then
+                mux.PsMuxer.Ps2FramesPerBlock = detected
+                Console.WriteLine($"  ps2 block N auto-detected from AVC SPS interval: {detected}")
+            Else
+                mux.PsMuxer.Ps2FramesPerBlock = 12
+                Console.WriteLine("  ps2 block N: could not detect SPS cadence, defaulting to 12")
+            End If
+        End If
+        ' default max_mean_bitrate byte
+        ' observed values:
+        '   L3.1 (720p CAVLC) :      5
+        '   L4.1 (1080p CABAC):     11
+        '   L4.1 SD (720x480) :      1  (bitrate class overrides level tier)
+        ' derive from AVC level, or user override via -mmb
+        ' value 0 (previous default) is legal but suboptimal
+        Dim mmb As Byte = DefaultMaxMeanBitrateForAvcLevel(sps.LevelIdc, sps.WidthPixels, sps.HeightPixels)
         Dim ps As PamfMuxStream = mux.AddAvcStream(
             profileIdc:=sps.ProfileIdc, levelIdc:=sps.LevelIdc,
             frameMbsOnly:=mbsOnly, frameRateCode:=frameRateCode,
@@ -244,8 +297,12 @@ Friend Module PamfMuxRunner
             ps.PstdBufferSize = overridePstdKb
             mux.HeaderWriter.OverrideLastAvcPstd(overridePstdKb)
         End If
+        ' MMB: overrideMmb >= 0 means user passed -mmb, use that value
+        ' itherwise use level-derived default we computed above
         If overrideMmb >= 0 Then
             mux.HeaderWriter.OverrideLastAvcMaxMeanBitrate(CByte(overrideMmb And &HFF))
+        Else
+            mux.HeaderWriter.OverrideLastAvcMaxMeanBitrate(mmb)
         End If
 
         ' slice into per-frame AU at VCL NAL boundaries (types 1, 5)
@@ -294,6 +351,266 @@ Friend Module PamfMuxRunner
             i += 1
         End While
         Return True
+    End Function
+
+    ' check if AVC stream uses in-loop deblocking filter
+    ' oarse the first slice NAL disable_deblocking_filter_idc:
+    '   idc = 0 = filter enabled                      = return 1
+    '   idc = 1 = filter disabled                     = return 0
+    '   idc = 2 = enabled but not at slice boundaries = return 1
+
+    ' if PPS deblocking_filter_control_present_flag is 0, field isn't coded and its inferred value is 0 (filter enabled)
+    ' if we can't parse header cleanly, fall back to 0
+    ' only the FIRST slice is checked because codec_info deblock byte is a stream-level property
+    Private Function InferAvcDeblockFilterEnabled(bytes As Byte(),
+                                                  sps As H264SpsInfo,
+                                                  pps As H264PpsInfo) As Byte
+        If pps Is Nothing Then Return 0
+        ' When per-slice deblock params are not coded, the value is inferred to 0
+        ' (filter enabled) per H.264 §7.4.3
+        If Not pps.DeblockingFilterControlPresent Then Return 1
+
+        Dim idc As Integer = ParseFirstSliceDisableDeblockIdc(bytes, sps, pps)
+        If idc < 0 Then Return 0     ' parse failure -> safe Sony default
+        Return If(idc = 1, CByte(0), CByte(1))
+    End Function
+
+    ' - walk NAL units
+    ' - find the first VCL slice (nal_unit_type 1 or 5)
+    ' - parse its slice_header() up to disable_deblocking_filter_idc
+    ' - return -1 on any parse failure so caller can fall back
+    ' (handle H.264 slice header layout for I/P/B/SI/SP slices)
+    Private Function ParseFirstSliceDisableDeblockIdc(bytes As Byte(),
+                                                      sps As H264SpsInfo,
+                                                      pps As H264PpsInfo) As Integer
+        ' find first VCL NAL (type 1 = non-IDR slice, 5 = IDR slice)
+        Dim nalStart As Integer = -1
+        Dim nalType As Integer = 0
+        Dim i As Integer = 0
+        While i < bytes.Length - 4
+            Dim sc As Integer = 0
+            If bytes(i) = 0 AndAlso bytes(i + 1) = 0 AndAlso bytes(i + 2) = 1 Then
+                sc = 3
+            ElseIf i + 3 < bytes.Length AndAlso bytes(i) = 0 AndAlso bytes(i + 1) = 0 _
+                   AndAlso bytes(i + 2) = 0 AndAlso bytes(i + 3) = 1 Then
+                sc = 4
+            End If
+            If sc > 0 Then
+                Dim hdr As Integer = i + sc
+                If hdr < bytes.Length Then
+                    Dim nt As Integer = bytes(hdr) And &H1F
+                    If nt = 1 OrElse nt = 5 Then
+                        nalStart = hdr + 1
+                        nalType = nt
+                        Exit While
+                    End If
+                End If
+                i += sc
+            Else
+                i += 1
+            End If
+        End While
+        If nalStart < 0 Then Return -1
+
+        ' extract RBSP (drop 0x03 emulation prevention bytes) into a slice-header buffer
+        ' we don't need whole slice, header is at most a few hundred bytes
+        Dim maxHeaderBytes As Integer = Math.Min(bytes.Length - nalStart, 512)
+        Dim rbsp As New List(Of Byte)(maxHeaderBytes)
+        Dim zeroRun As Integer = 0
+        For k As Integer = 0 To maxHeaderBytes - 1
+            Dim b As Byte = bytes(nalStart + k)
+            If zeroRun = 2 AndAlso b = 3 Then
+                zeroRun = 0
+                Continue For
+            End If
+            rbsp.Add(b)
+            zeroRun = If(b = 0, zeroRun + 1, 0)
+        Next
+        If rbsp.Count = 0 Then Return -1
+
+        Try
+            Dim br As New SliceBitReader(rbsp.ToArray())
+            br.Ue()                                                            ' first_mb_in_slice
+            Dim sliceTypeRaw As UInteger = br.Ue()                             ' slice_type
+            Dim sliceType As Integer = CInt(sliceTypeRaw Mod 5UI)              ' 0=P 1=B 2=I 3=SP 4=SI
+            br.Ue()                                                            ' pic_parameter_set_id
+            If sps.SeparateColourPlaneFlag Then br.U(2)                        ' colour_plane_id
+            br.U(sps.Log2MaxFrameNumMinus4 + 4)                                ' frame_num
+            Dim fieldPicFlag As UInteger = 0UI
+            If Not sps.FrameMbsOnlyFlag Then
+                fieldPicFlag = br.U(1)
+                If fieldPicFlag <> 0UI Then br.U(1)                            ' bottom_field_flag
+            End If
+            If nalType = 5 Then br.Ue()                                        ' idr_pic_id
+            If sps.PicOrderCntType = 0 Then
+                br.U(sps.Log2MaxPicOrderCntLsbMinus4 + 4)                      ' pic_order_cnt_lsb
+                If pps.BottomFieldPicOrderInFramePresentFlag AndAlso fieldPicFlag = 0UI Then
+                    br.Se()                                                    ' delta_pic_order_cnt_bottom
+                End If
+            End If
+            If sps.PicOrderCntType = 1 AndAlso Not sps.DeltaPicOrderAlwaysZeroFlag Then
+                br.Se()                                                        ' delta_pic_order_cnt[0]
+                If pps.BottomFieldPicOrderInFramePresentFlag AndAlso fieldPicFlag = 0UI Then
+                    br.Se()                                                    ' delta_pic_order_cnt[1]
+                End If
+            End If
+            If pps.RedundantPicCntPresentFlag Then br.Ue()                     ' redundant_pic_cnt
+
+            ' for I/SI slices (2/4)
+            ' P/B-specific fields aren't coded and neither is pred_weight_table (only applies to weighted P/B)
+            ' typical case for the first slice (IDR = I-slice), so we can parse the rest cleanly
+            ' reject non-I first slices to keep the parser bounded
+            If sliceType <> 2 AndAlso sliceType <> 4 Then Return -1
+
+            ' no ref_pic_list_modification for I/SI
+            ' no pred_weight_table for I/SI
+
+            ' dec_ref_pic_marking: coded iff nal_ref_idc != 0
+            '
+            ' - IDR (type 5): u(1) no_output_of_prior_pics + u(1) long_term_reference
+            ' - non-IDR I-slices with nal_ref_idc != 0: adaptive_ref_pic_marking_mode_flag + optional MMCO loop
+            ' first slice is usually IDR so we take that branch
+            '
+            Dim nalRefIdc As Integer = (bytes(nalStart - 1) >> 5) And &H3
+            If nalRefIdc <> 0 Then
+                If nalType = 5 Then
+                    br.U(1)                                                    ' no_output_of_prior_pics_flag
+                    br.U(1)                                                    ' long_term_reference_flag
+                Else
+                    ' non-IDR I-slice with references: MMCO loop, bail rather than parse
+                    Return -1
+                End If
+            End If
+
+            ' cabac_init_idc: coded iff entropy_coding_mode_flag && slice_type != I/SI
+            ' we're on an I/SI slice so this is skipped
+            br.Se()                                                            ' slice_qp_delta
+            ' no slice_qs_delta (only SP/SI)
+            If pps.DeblockingFilterControlPresent Then
+                Return CInt(br.Ue() And &H3UI)                                 ' disable_deblocking_filter_idc
+            End If
+            Return 0
+        Catch ex As Exception
+            Return -1
+        End Try
+    End Function
+
+    ' Minimal Exp-Golomb bit reader for slice-header parsing.
+    Private Class SliceBitReader
+        Private ReadOnly _data As Byte()
+        Private _pos As Integer
+        Public Sub New(data As Byte())
+            _data = data
+        End Sub
+        Public Function U(n As Integer) As UInteger
+            Dim v As UInteger = 0UI
+            For k As Integer = 0 To n - 1
+                If _pos >= _data.Length * 8 Then Throw New InvalidOperationException("Past end")
+                Dim bit As Integer = (_data(_pos >> 3) >> (7 - (_pos And 7))) And 1
+                v = (v << 1) Or CUInt(bit)
+                _pos += 1
+            Next
+            Return v
+        End Function
+        Public Function Ue() As UInteger
+            Dim zeros As Integer = 0
+            While _pos < _data.Length * 8 AndAlso U(1) = 0UI
+                zeros += 1
+                If zeros > 31 Then Throw New InvalidOperationException("ue() codeword too long")
+            End While
+            If zeros = 0 Then Return 0UI
+            Dim suffix As UInteger = U(zeros)
+            Return (1UI << zeros) - 1UI + suffix
+        End Function
+        Public Function Se() As Integer
+            Dim v As UInteger = Ue()
+            If (v And 1UI) = 0UI Then
+                Return -CInt(v >> 1)
+            Else
+                Return CInt((v + 1UI) >> 1)
+            End If
+        End Function
+    End Class
+
+    ' max_mean_bitrate byte per AVC level+resolution class
+    ' observed:
+    '  L3.1 720p CAVLC:     mmb = 5
+    '  L4.1 1080p CABAC:    mmb = 11
+    '  L4.1 720x480 (SD):   mmb = 1   (SD overrides level tier)
+    ' !!! could be a bitrate class ID rather than a literal Mbps count !!!
+    Private Function DefaultMaxMeanBitrateForAvcLevel(levelIdc As Integer, widthPx As Integer, heightPx As Integer) As Byte
+        ' SD resolutions (≤ 720x576) use a lower mmb regardless of level
+        If widthPx <= 720 AndAlso heightPx <= 576 Then Return 1
+        If levelIdc >= 41 Then Return 11    ' L4.1 and up (1080p, high-bitrate 720p)
+        If levelIdc >= 31 Then Return 5     ' L3.1 (720p CAVLC)
+        If levelIdc >= 30 Then Return 3     ' L3.0 (SD-ish, extrapolated)
+        Return 1                            ' L2.1 and below
+    End Function
+
+    ' detect frame-interval between successive SPS insertions in an Annex-B AVC stream
+    '
+    ' Sony PAMF encoder inserts one SPS at the start of each "seek block"
+    ' ps2 marker payload N field (bytes 16-17) encodes exactly that block size
+    '
+    ' return 0 if we can't reliably determine the interval:
+    '  - fewer than 3 SPS NALs (need at least 2 intervals for consistency check)
+    '  - intervals are inconsistent (varying by more than 1 across samples)
+    '  - result out of the [1, 64] range
+    '
+    ' callers should fall back to default (12) when this returns 0
+    Private Function DetectAvcSpsInterval(bytes As Byte()) As Integer
+        Dim frameCount As Integer = 0
+        Dim spsFrames As New List(Of Integer)()
+        Dim haveVclInCurrentFrame As Boolean = False
+        Dim spsSeenInCurrentFrame As Boolean = False
+
+        Dim i As Integer = 0
+        While i < bytes.Length - 4
+            Dim nalHdr As Integer = FindAnnexBNal(bytes, i)
+            If nalHdr < 0 Then Exit While
+            Dim nt As Integer = bytes(nalHdr) And &H1F
+            Dim isVcl As Boolean = (nt = 1 OrElse nt = 5)
+            Dim isFirstSlice As Boolean = isVcl AndAlso
+                (nalHdr + 1 < bytes.Length) AndAlso ((bytes(nalHdr + 1) And &H80) <> 0)
+
+            If nt = 9 AndAlso haveVclInCurrentFrame Then
+                ' AUD after a VCL → previous frame complete, new frame starts here
+                frameCount += 1
+                haveVclInCurrentFrame = False
+                spsSeenInCurrentFrame = False
+            ElseIf isVcl AndAlso isFirstSlice AndAlso haveVclInCurrentFrame Then
+                ' first-slice of new picture without an intervening AUD
+                frameCount += 1
+                haveVclInCurrentFrame = False
+                spsSeenInCurrentFrame = False
+            End If
+
+            If nt = 7 AndAlso Not spsSeenInCurrentFrame Then     ' SPS
+                spsFrames.Add(frameCount)
+                spsSeenInCurrentFrame = True
+            ElseIf isVcl Then
+                haveVclInCurrentFrame = True
+            End If
+            i = nalHdr + 1
+
+            ' bail early once we've gathered 8 SPS samples
+            If spsFrames.Count >= 8 Then Exit While
+        End While
+
+        If spsFrames.Count < 3 Then Return 0
+
+        ' check the last few intervals for consistency (skip the first, which is often anomalous for streams that start with a burst of RAPs at frames 0,3,5,6)
+        Dim intervals As New List(Of Integer)()
+        For k As Integer = 2 To spsFrames.Count - 1
+            intervals.Add(spsFrames(k) - spsFrames(k - 1))
+        Next
+        If intervals.Count = 0 Then Return 0
+        Dim first As Integer = intervals(0)
+        For Each v In intervals
+            If Math.Abs(v - first) > 1 Then Return 0    ' inconsistent
+        Next
+        If first < 1 OrElse first > 64 Then Return 0
+        Return first
     End Function
 
     Private Function FindAvcAuStarts(bytes As Byte()) As List(Of Integer)
@@ -665,7 +982,15 @@ Friend Module PamfMuxRunner
         ' one AU per frame, PTS spaced by samples-per-frame (2048) at sample rate converted to 90 kHz
         ' pts_step = 2048 * 90000 / sample_rate
         Dim ptsStep As Long = CLng(2048L * 90000L \ CLng(sr))
-        Dim ptsBase As Long = 90000L
+        ' AT3+ has a decoder priming delay of 2416 samples (encoder look-ahead + filterbank/QMF warm-up)
+        ' first N samples the decoder emits are silence / pre-roll
+        '
+        ' audio waveform actual t=0 lands at DTS = ptsBase - priming
+        ' for 48 kHz AT3+, first AU PTS = video_first_pts - 2416 * 90000 / 48000 = video_first_pts - 4530
+        '
+        Const At3PlusPrimingSamples As Long = 2416L
+        Dim primingTicks As Long = At3PlusPrimingSamples * 90000L \ CLng(sr)
+        Dim ptsBase As Long = 90000L - primingTicks
         Dim zeros(3) As Byte
         For i As Integer = 0 To frames.Count - 1
             Dim raw As Byte() = frames(i)

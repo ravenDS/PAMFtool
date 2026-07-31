@@ -16,17 +16,25 @@ Module Program
         Dim forceNoDeblock As Boolean = False
         Dim noAtsc As Boolean = False
         ' -pace <Mbps> : SCR advances at this rate instead of mux_rate (48 Mbps)
-        ' 0  = auto (derive from measured content bitrate)
-        ' -1 = disabled (legacy behavior, SCR advances at MuxRateBps)
-        Dim paceMbps As Double = 0.0
+        '                off (default) = SCR advances at MuxRateBps with AU-start anchoring to (video: DTS - 90000; audio: PTS - AudioTargetLeadTicks)
+        '                auto = derive from measured content bitrate)
+        '                <positive> = fixed pacing rate in Mbps
+        Dim paceMbps As Double = -1.0
         ' -pstd <KB> : override AVC P-STD buffer size (KB)
         '              0 = use per-level default
         Dim overridePstdKb As Integer = 0
         ' -mmb <n> : override max_mean_bitrate in AVC codec_info byte 25
-        ' Sony encodes 11 for 1080p L4.1 CABAC and 5 for 720p L3.1 CAVLC, some games may inspect it
+        '            Sony encodes 11 for 1080p L4.1 CABAC and 5 for 720p L3.1 CAVLC, some games may inspect it
         Dim overrideMmb As Integer = -1
-        ' -ps2-block <N> : private_stream_2 cadence in AUs, default = 12
-        Dim ps2FramesPerBlock As Integer = 12
+        ' -ps2-block <N> : private_stream_2 cadence in AUs
+        '                  auto-detected, or manual override
+        Dim ps2FramesPerBlock As Integer = -1
+        ' -muxrate <kbps> : override mux_rate (48000/24000/12000)
+        '                   0 = leave at PsMuxer default (48000 kbps)
+        Dim overrideMuxRateBps As Integer = 0
+        ' -std-delay <ticks> : override std_delay_bound
+        '                      0 = auto (default 90000 or 67500 based on AVC HRD peak)
+        Dim overrideStdDelayTicks As Integer = 0
         Dim i As Integer = 0
         While i < args.Length
             Dim a As String = args(i)
@@ -77,6 +85,31 @@ Module Program
                         Environment.Exit(1)
                     End If
                     i += 1
+                Case "-muxrate", "--muxrate", "/muxrate"
+                    Dim v As Integer
+                    If i + 1 >= args.Length OrElse Not Integer.TryParse(args(i + 1), v) Then
+                        Console.Error.WriteLine("Error: -muxrate requires a value in kbps (48000, 24000, or 12000).")
+                        Environment.Exit(1)
+                    End If
+                    Dim bps As Integer = v * 1000
+                    If Not PamfMux.Mpeg2PsMuxer.IsAllowedMuxRate(bps) Then
+                        Console.Error.WriteLine("Error: -muxrate must be 48000, 24000, or 12000 kbps per Sony's PAMF Tools spec.")
+                        Environment.Exit(1)
+                    End If
+                    overrideMuxRateBps = bps
+                    i += 1
+                Case "-std-delay", "--std-delay", "/std-delay"
+                    Dim v As Integer
+                    If i + 1 >= args.Length OrElse Not Integer.TryParse(args(i + 1), v) Then
+                        Console.Error.WriteLine("Error: -std-delay requires a value in 1/90000 sec ticks (typical 90000 or 67500).")
+                        Environment.Exit(1)
+                    End If
+                    If v <= 0 OrElse v > 3 * 90000 Then
+                        Console.Error.WriteLine("Error: -std-delay out of range (must be 1..270000).")
+                        Environment.Exit(1)
+                    End If
+                    overrideStdDelayTicks = v
+                    i += 1
                 Case "-h", "--help", "/?", "/h", "-?"
                     PrintUsage() : Return
                 Case Else : positional.Add(a)
@@ -108,7 +141,8 @@ Module Program
                 positional.Add(BuildAutoRemuxPath(positional(0)))
             End If
             PamfMuxRunner.Run(positional, noEp, forceDeblock, forceNoDeblock, noAtsc, paceMbps,
-                              overridePstdKb, overrideMmb, ps2FramesPerBlock)
+                              overridePstdKb, overrideMmb, ps2FramesPerBlock, overrideMuxRateBps,
+                              overrideStdDelayTicks)
             Return
         End If
 
@@ -133,21 +167,29 @@ Module Program
         Console.WriteLine("PlayStation Advanced Movie Format (PAMF) Muxer/Demuxer")
         Console.WriteLine()
         Console.WriteLine("Demux:  PAMFtool [-demux] <input.pamf> [outDir] [-info]")
-        Console.WriteLine("Mux:    PAMFtool [-mux]   <inputDir>   [output.pamf] [-noep] [-noatsc] [-deblock | -nodeblock] [-pace <Mbps>] [-pstd <KB>] [-mmb <n>]")
+        Console.WriteLine("Mux:    PAMFtool [-mux]   <inputDir>   [output.pamf] [-noep] [-noatsc]")
+        Console.WriteLine("        [-deblock | -nodeblock] [-pace <Mbps>] [-pstd <KB>] [-mmb <n>]")
+        Console.WriteLine("        [-ps2-block <N>] [-muxrate <kbps>]")
         Console.WriteLine()
         Console.WriteLine("Mux parameters:")
-        Console.WriteLine("  -noep       Skip writing an entry-point seek table in the header.")
-        Console.WriteLine("  -noatsc     Ignore any 'atsc' RIFF chunk in .at3 inputs.")
-        Console.WriteLine("  -deblock    Force codec-info deblock byte to 1 (overrides PPS-derived value).")
-        Console.WriteLine("  -nodeblock  Force codec-info deblock byte to 0 (overrides PPS-derived value).")
-        Console.WriteLine("  -pace <v>   Set SCR pacing rate.")
-        Console.WriteLine("                <v> = <Mbps>  Fixed rate")
-        Console.WriteLine("                <v> = auto    Compute from measured content bitrate (default)")
-        Console.WriteLine("                <v> = off     Advance SCR at mux_rate (legacy front-loaded delivery)")
-        Console.WriteLine("  -pstd <KB>  Override AVC P-STD buffer size in KB (1..8191).")
-        Console.WriteLine("              Default is per-level (1505 for L3.1, 3703 for L4.1, etc).")
-        Console.WriteLine("  -mmb <n>    Override max_mean_bitrate byte in AVC codec_info (0..255).")
-        Console.WriteLine("              Sony encodes 11 for 1080p L4.1 CABAC, 5 for 720p L3.1 CAVLC.")
+        Console.WriteLine("  -noep            Skip writing an entry-point seek table in the header.")
+        Console.WriteLine("  -noatsc          Ignore any 'atsc' RIFF chunk in .at3 inputs.")
+        Console.WriteLine("  -deblock         Force codec-info deblock byte to 1 (overrides PPS-derived value).")
+        Console.WriteLine("  -nodeblock       Force codec-info deblock byte to 0 (overrides PPS-derived value).")
+        Console.WriteLine("  -pace <v>        Set SCR pacing rate. Default: off (SCR advances at mux_rate).")
+        Console.WriteLine("                      <v> = <Mbps>  Fixed rate")
+        Console.WriteLine("                      <v> = auto    Compute from measured content bitrate")
+        Console.WriteLine("                      <v> = off     Advance SCR at mux_rate (default)")
+        Console.WriteLine("  -pstd <KB>       Override AVC P-STD buffer size in KB (1..8191).")
+        Console.WriteLine("                      Default is per-level (1505 for L3.1, 3703 for L4.1, etc).")
+        Console.WriteLine("  -mmb <n>         Override max_mean_bitrate byte in AVC codec_info (0..255).")
+        Console.WriteLine("                      Sony encodes 11 for 1080p L4.1 CABAC, 5 for 720p L3.1 CAVLC.")
+        Console.WriteLine("  -ps2-block <N>   private_stream_2 marker cadence in AUs.")
+        Console.WriteLine("  -muxrate <kbps>  Override pack_header mux_rate. Per Sony PAMF Tools spec,")
+        Console.WriteLine("                      48000 (default), 24000, or 12000 are valid.")
+        Console.WriteLine("  -std-delay <tk>  Override std_delay_bound (u32 at header 0x66).")
+        Console.WriteLine("                      90000 (1.00 s) when peak <= 30 Mbps")
+        Console.WriteLine("                      67500 (0.75 s) when > 30 Mbps. Auto-detected from AVC HRD.")
         Console.WriteLine()
         Console.WriteLine("Additional parameters:")
         Console.WriteLine("  -info       Print info on PAMF file & streams.")

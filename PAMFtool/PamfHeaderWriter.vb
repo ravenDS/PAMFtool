@@ -286,16 +286,17 @@ Namespace PamfMux
             })
         End Sub
 
-        Public Sub AddEpEntry(pts90 As Long, byteOffset As Long)
-            _epEntries.Add(New PamfMux.EpEntry() With {
-                .Pts = pts90, .ByteOffset = byteOffset
-            })
+        ' add one EP entry, pass the mux EpEntry directly (rather than just PTS/offset)
+        ' so RefPictureEndSectors (populated by Mpeg2PsMuxer.PatchAvcPs2AndEp) is preserved
+        Public Sub AddEpEntry(entry As PamfMux.EpEntry)
+            _epEntries.Add(entry)
         End Sub
 
         ' muxRateUnits is the value to write at offset 0x64, in MPEG-2 PS mux_rate convention (50 bytes/sec per unit)
         ' for a 24 Mbps stream thats 24_000_000 / 8 / 50 = 60000 = 0xEA60
         Public Function Build(numPacks As Integer, totalDuration90 As Long,
-                              muxRateUnits As Integer) As Byte()
+                              muxRateUnits As Integer,
+                              Optional stdDelayBoundTicks As Integer = 90000) As Byte()
             Array.Copy(TemplateBytes, _header, TemplateBytes.Length)
             Dim n As Integer = _streams.Count
             WriteU32BE(_header, &HC, CUInt(numPacks))
@@ -306,6 +307,10 @@ Namespace PamfMux
             WriteU32BE(_header, &H7C, durLow)
             ' mux_rate_bound is u32 at 0x62
             WriteU32BE(_header, &H62, CUInt(muxRateUnits And &HFFFFFFFFL))
+            ' std_delay_bound is u32 at 0x66, in 1/90000 second units
+            ' 1.00 sec (90000 ticks) when peak <= 30 Mbps
+            ' 0.75 sec (67500 ticks) when peak > 30 Mbps
+            WriteU32BE(_header, &H66, CUInt(stdDelayBoundTicks And &HFFFFFFFFL))
             _header(&H6D) = CByte(n)
             WriteU16BE(_header, &H84, CUShort(&H32 + &H30 * (n - 1)))
             _header(&H87) = CByte(n)
@@ -354,11 +359,21 @@ Namespace PamfMux
             For i As Integer = 0 To count - 1
                 Dim e As PamfMux.EpEntry = _epEntries(i)
                 Dim eo As Integer = epStart + i * 12
-                ' writes bits 15:14 = 0b11 in value0 as a validity marker
-                ' bits 12:0 encode the sector offset from THIS RAP to the next non-RAP AU-start
-                ' we don't currently track that in the mux queue so we leave it at 0
-                WriteU16BE(_header, eo + 0, &HC000US)
-                WriteU16BE(_header, eo + 2, 0US)   ' pts_high
+                ' value0 encoding:
+                '   bits 15:14 = indexN - 1 (Sony writes 0b11 = indexN 4 for every EP)
+                '   bit  13    = unused?? (0)
+                '   bits 12:0  = sectors "to end of the 4th picture pack" (RAW value)
+                '                the reader computes nThRefPictureOffset = (raw+1)*2048
+                '                this is the exact same value ps2 payload bytes 8..9 hold for the same block
+                '
+                ' the sectors value is measured from this EP RAP pack to the pack containing the last byte of the 4th picture in its 12-frame block
+                ' captured live during mux by Mpeg2PsMuxer.PatchAvcPs2AndEp (see EpEntry.RefPictureEndSectors)
+                Dim refSectors As Integer = e.RefPictureEndSectors
+                If refSectors < 0 Then refSectors = 0
+                If refSectors > &H1FFF Then refSectors = &H1FFF
+                Dim value0 As UShort = CUShort(&HC000US Or CUShort(refSectors And &H1FFF))
+                WriteU16BE(_header, eo + 0, value0)
+                WriteU16BE(_header, eo + 2, 0US)   ' pts_high (always 0; PTS caps at UINT32_MAX)
                 WriteU32BE(_header, eo + 4, CUInt(e.Pts And &HFFFFFFFFL))
                 Dim rpnSectors As ULong = CULng((e.ByteOffset And &HFFFFFFFFL) \ 2048L)
                 WriteU32BE(_header, eo + 8, CUInt(rpnSectors And &HFFFFFFFFUL))

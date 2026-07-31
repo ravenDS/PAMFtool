@@ -55,6 +55,19 @@ Namespace PamfMux
     Public Class EpEntry
         Public Property Pts As Long
         Public Property ByteOffset As Long
+        ' number of sectors from the RAP pack to the end of the pack
+        ' encoded as 'sectors - 1' in the PAMF EP-table value0 bits 12:0
+        ' nThRefPictureOffset = ((value0 & 0x1FFF) * 0x800) + 0x800)
+        Public Property RefPictureEndSectors As Integer
+    End Class
+
+    ' state captured at each 12-AU block boundary
+    Public Class Ps2BlockPatch
+        Public Property Ps2PayloadFileOffset As Long   ' file offset of the ps2 marker's payload byte 0 (00 00 01 BF LL LL <here>)
+        Public Property BlockStartPackOffset As Long   ' file offset of the pack containing the ps2 marker (= EP's RAP pack)
+        Public Property Ep As EpEntry                  ' EP entry associated with this block (updated with RefPictureEndSectors after patching)
+        Public Property FrameEndPackOffsets As Long()  ' packStart of the pack containing the last byte of frames 0..3 (0 = not yet observed)
+        Public Property FrameEndsRecorded As Integer   ' how many of the four have been observed
     End Class
 
     Public Class Mpeg2PsMuxer
@@ -63,10 +76,23 @@ Namespace PamfMux
         Public Const AudioLeadTicks As Long = 9000L
         Public Const InitialScr As Long = 30L
 
-        ' Sony PAMF encodes use mux_rate_bound = 48 Mbps
-        ' (0x1D4C0 in the PAMF sequence-info header, unit is 50 bytes/s so 120000 * 50 * 8 = 48000000)
-        ' this is the value written into the pack_header mux_rate field - the physical delivery capacity of the transport
+        ' PAMF only accept these rates:
+        '   48000 kbps   (default, used by most PAMFs)
+        '   24000 kbps
+        '   12000 kbps   (typical for SD content)
+        ' pack_header mux_rate field encodes at 50-byte/s units
+        ' 48 Mbps = 120000 units (0x1D4C0) stored also in PAMF sequence-info header
         Public Property MuxRateBps As Integer = 48_000_000
+
+        Public Shared ReadOnly Property AllowedMuxRatesBps As Integer() =
+            {12_000_000, 24_000_000, 48_000_000}
+
+        Public Shared Function IsAllowedMuxRate(bps As Integer) As Boolean
+            For Each v In AllowedMuxRatesBps
+                If bps = v Then Return True
+            Next
+            Return False
+        End Function
 
         ' rate at which SCR advances between packs, independent of MuxRateBps 
         Public Property EffectiveDeliveryBps As Integer = 48_000_000
@@ -86,6 +112,16 @@ Namespace PamfMux
         ' offsets (in output stream) of every private_stream_2 tag we emit
         ' populated in WritePackedStream, used at the end to patch each tag bytes 2-3 (sectors_to_next - 1) when the actual packing is known
         Private ReadOnly _ps2Offsets As New List(Of Long)()
+
+        ' one entry per 12-AU AVC block (ps2/EP cadence)
+        ' populated when a 66-byte-format ps2 marker is emitted and its associated EP entry is registered
+        ' each entry accumulates the pack offset of the last byte of frames 0..3 as those AUs are dequeued
+        Private ReadOnly _avcBlockPatches As New List(Of Ps2BlockPatch)()
+        Private _currentAvcBlockPatch As Ps2BlockPatch
+
+        ' set to True as soon as the first video access unit begins to emit
+        ' while False, PickNextStream ignores AudioLeadTicks so video wins the first pack
+        Private _firstVideoRapEmitted As Boolean
 
         ' bytes consumed of the current AU that hasn't been fully emitted (next goes into the next audio PES of the same stream)
         Private ReadOnly _audioPartial As New Dictionary(Of Integer, Integer)()
@@ -159,35 +195,62 @@ Namespace PamfMux
 
         Public Sub WritePackedStream(output As Stream)
             PayloadStartOffset = output.Position
-            Dim scr As Long = InitialScr
+            ' !!! NEEDS MORE RESEARCH !!!
+            ' SCR is tracked at 27 MHz precision 
+            ' pack header encodes SCR as a 33-bit 90 kHz base plus a 9-bit 27 MHz extension where 27MHz = 90kHz*300
+            Dim scr27 As Long = 9216L
+            Dim scr As Long = scr27 \ 300L
             Dim muxRateUnits As Integer = MuxRateBps \ 8 \ 50
             _ps2Offsets.Clear()
+            _avcBlockPatches.Clear()
+            _currentAvcBlockPatch = Nothing
+            _firstVideoRapEmitted = False
 
+            ' M2V files get an initial pack with just system_header + padding_stream
+            ' AVC files: skip it
             If Not HasMpeg2VideoStream() Then
-                Dim initialVideoPstd As Integer = FirstVideoPstd()
-                EmitInitialPack(output, scr, muxRateUnits, initialVideoPstd)
+                ' AVC path, no initial pack
+                ' fall into main loop which to emit sys_header + ps2 marker + first video PES on the very first pack
             End If
 
             While HasMoreData()
-                Dim s As PamfMuxStream = PickNextStream()
+                Dim s As PamfMuxStream = PickNextStream(scr)
                 If s Is Nothing Then Exit While
 
-                ' SCR pacing: when EffectiveDeliveryBps < MuxRateBps we want bytes to arrive on the playback timeline
-                ' we anchor SCR directly to the AU being emitted:
+                ' SCR anchor at AU-start packs
+                ' between packs, SCR advances at mux_rate
                 '
-                '  at every AU-start pack: SCR = max(prev+small, AU.DTS - lead)
-                '  between AU-starts:      SCR = prev + small  (fast advance)
-                '
-                ' buffer_lead = 90000 ticks (1 s) matches std_delay_bound
-                Dim pacing As Boolean = (EffectiveDeliveryBps > 0 AndAlso EffectiveDeliveryBps < MuxRateBps)
-                If pacing AndAlso Not _splitState.ContainsKey(s.Index) AndAlso s.AuQueue.Count > 0 Then
+                ' at the start of a new AU (not mid-split), we anchor:
+                '   video AU: SCR = max(current, AU.DTS - std_delay_bound)         (90000 = 1 second target lead)
+                '                                            
+                '   audio AU: SCR = max(current, AU.PTS - AudioTargetLeadTicks)    (82306)
+                '                                            
+                ' at pack 0 the anchor produces a negative target so SCR stays at 30
+                ' at pack 102 the anchor produces 85470 - 82306 = 3164 to match Sony SCR
+                If Not _splitState.ContainsKey(s.Index) AndAlso s.AuQueue.Count > 0 Then
                     Dim head As AccessUnit = s.AuQueue.Peek()
-                    Dim target As Long = head.Dts - PtsClockHz
-                    If target > scr Then scr = target
+                    Dim target As Long
+                    If s.IsVideo Then
+                        target = head.Dts - PtsClockHz
+                    ElseIf s.Codec = PamfStreamType.LPCM Then
+                        target = head.Pts - PtsClockHz
+                    Else
+                        ' compressed audio (AT3+/AC-3): anchor to PTS - AudioTargetLeadTicks
+                        target = head.Pts - AudioTargetLeadTicks
+                    End If
+                    If target > scr Then
+                        scr = target
+                        scr27 = scr * 300L   ' anchor promoted; drop accumulated ext
+                    End If
                 End If
 
                 Dim packStart As Long = output.Position
-                WritePackHeader(output, scr, 0, muxRateUnits)
+                ' encode SCR as (base33, ext9)
+                ' ext9 in [0, 299] carries the sub-90kHz fractional at 27 MHz resolution
+                ' Sony writes ext=216 at pack 0 (which plus base=30 gives total 30.72 90kHz ticks = 9216 27MHz ticks)
+                Dim scrBase33 As Long = scr27 \ 300L
+                Dim scrExt9 As Integer = CInt(scr27 Mod 300L)
+                WritePackHeader(output, scrBase33, scrExt9, muxRateUnits)
 
                 Dim spaceLeft As Integer = SectorSize - PackHeaderLen
 
@@ -200,6 +263,7 @@ Namespace PamfMux
                         WriteSonyPictureMarker(output, s.PesStreamId,
                                                head.VideoPictureIndex = 0, head.VideoVbvDelay)
                         _ps2Offsets.Add(ps2Off)
+                        _firstVideoRapEmitted = True
                         spaceLeft = SectorSize - CInt(output.Position - packStart)
                     ElseIf Ps2FramesPerBlock > 0 AndAlso s.NextAuEmitIndex Mod Ps2FramesPerBlock = 0 Then
                         WriteSystemHeader(output, muxRateUnits, s.PstdBufferSize)
@@ -213,7 +277,28 @@ Namespace PamfMux
                             refs(k) = au.IsReferenceFrame
                             k += 1
                         Next
+                        Dim ps2Start As Long = output.Position
                         WriteAvcRapMarkerSony(output, s.PesStreamId, n, sizes, refs)
+                        _firstVideoRapEmitted = True
+
+                        ' register EP + block-patch info at the same cadence as ps2 (every N AUs)
+                        ' one EP per ps2 marker
+                        Dim ep As New EpEntry() With {
+                            .Pts = head.Pts,
+                            .ByteOffset = packStart - PayloadStartOffset
+                        }
+                        s.EpEntries.Add(ep)
+
+                        Dim bp As New Ps2BlockPatch() With {
+                            .Ps2PayloadFileOffset = ps2Start + 6,  ' after 4 SC + 2 length
+                            .BlockStartPackOffset = packStart,
+                            .Ep = ep,
+                            .FrameEndPackOffsets = New Long(3) {},
+                            .FrameEndsRecorded = 0
+                        }
+                        _avcBlockPatches.Add(bp)
+                        _currentAvcBlockPatch = bp
+
                         spaceLeft = SectorSize - CInt(output.Position - packStart)
                     ElseIf Ps2FramesPerBlock = 0 AndAlso head.IsRandomAccessPoint Then
                         ' legacy 4-byte stub, emitted at every IDR AU
@@ -225,11 +310,16 @@ Namespace PamfMux
 
                 EmitOnePesIntoSector(output, s, spaceLeft, packStart)
 
-                ' advance at MuxRateBps (fast, 30 ticks/pack)
-                ' if pacing is on, the AU-start jump above does the actual playback-alignment work
+                ' advance SCR at mux_rate in 27 MHz units (exact, no rounding)
+                ' for 48 Mbps mux_rate & 2048-byte packs the advance is 9216 27 MHz ticks
+                ' any other pack size scales proportionally
                 Dim packBytes As Long = output.Position - packStart
-                scr += (packBytes * PtsClockHz * 8L) \ MuxRateBps
-                If scr >= (1L << 33) Then scr -= (1L << 33)
+                scr27 += (packBytes * 8L * 27000000L) \ CLng(MuxRateBps)
+                scr = scr27 \ 300L
+                If scr >= (1L << 33) Then
+                    scr -= (1L << 33)
+                    scr27 -= (1L << 33) * 300L
+                End If
             End While
 
             ' MPEG_program_end_code, pad to sector boundary
@@ -261,6 +351,44 @@ Namespace PamfMux
                 Next
                 output.Position = endPos
             End If
+
+            PatchAvcPs2AndEp(output)
+        End Sub
+
+        ' fill sectors to end of frame N fields (payload bytes 2..9)
+        ' setStreamSize = ep.nThRefPictureOffset + 2048
+        ' need to know how many bytes past the EP to read to have 'indexN' reference pictures available
+        Private Sub PatchAvcPs2AndEp(output As Stream)
+            If _avcBlockPatches.Count = 0 Then Return
+            Dim endPos As Long = output.Position
+            For Each bp As Ps2BlockPatch In _avcBlockPatches
+                Dim sectorOffsets(3) As Integer
+                For k As Integer = 0 To 3
+                    If k < bp.FrameEndsRecorded AndAlso bp.FrameEndPackOffsets(k) >= bp.BlockStartPackOffset Then
+                        Dim delta As Long = (bp.FrameEndPackOffsets(k) - bp.BlockStartPackOffset) \ SectorSize
+                        If delta < 0 Then delta = 0
+                        If delta > &HFFFFL Then delta = &HFFFFL
+                        sectorOffsets(k) = CInt(delta)
+                    Else
+                        sectorOffsets(k) = 0
+                    End If
+                Next
+
+                ' patch values at ps2 payload bytes 2..3, 4..5, 6..7, 8..9
+                output.Position = bp.Ps2PayloadFileOffset + 2
+                For k As Integer = 0 To 3
+                    output.WriteByte(CByte((sectorOffsets(k) >> 8) And &HFF))
+                    output.WriteByte(CByte(sectorOffsets(k) And &HFF))
+                Next
+
+                ' mirror the 4th value into the EP entry for header writing
+                ' nThRefPictureOffset = ((value0 & 0x1fff) * 0x800) + 0x800
+                ' Sony value0 bits 15:14 = 0b11
+                If bp.Ep IsNot Nothing Then
+                    bp.Ep.RefPictureEndSectors = sectorOffsets(3)
+                End If
+            Next
+            output.Position = endPos
         End Sub
 
         ' Restored from the previously-shipping muxer for AVC compatibility: at each
@@ -439,23 +567,96 @@ Namespace PamfMux
             Return False
         End Function
 
-        Private Function PickNextStream() As PamfMuxStream
-            Dim best As PamfMuxStream = Nothing
-            Dim bestKey As Long = Long.MaxValue
+        ' target lead (ticks, 90 kHz) between when compressed-audio AU is delivered (SCR at its pack) and when it will be consumed (its PTS)
+        '
+        ' documented Sony constants:
+        '     std_delay_bound - 2 * audio_frame_duration_ticks
+        '   = 90000 - 2 * (2048 * 90000 / 48000)  (AT3+ frame = 2048 samples)
+        '   = 90000 - 7680
+        '   = 82320 ticks 
+        ' the mux delivers each audio AU one second (std_delay) ahead of its PTS, minus two frames required by AT3+ filterbank
+        '
+        ' for AC-3 or LPCM the correct lead value differs
+        '
+        ' !!! only AT3+ is verified against a Sony reference !!!
+        Public Property AudioTargetLeadTicks As Long = 82306L
+
+        Private Function PickNextStream(scr As Long) As PamfMuxStream
+            ' codec-specific scheduling:
+            '
+            '  AT3+, AC3: SCR-urgency threshold
+            '  wins when head.PTS - SCR <= AudioTargetLeadTicks
+            '  long gaps between packs are fine
+            '
+            '  LPCM: pure PTS ordering
+            '  wins when head.PTS < competing video.PTS
+            '
+            '  VIDEO: always eligible, pack 0 RAP is enforced by _firstVideoRapEmitted gate
+            '
+            ' priority order:
+            '  1. compressed audio that is past-due
+            '  2. LPCM whose PTS is smaller than video PTS (natural PTS ordering)
+            '  3. video
+            '  4. any remaining audio
+
+            Dim video_s As PamfMuxStream = Nothing
+            Dim video_key As Long = Long.MaxValue
+            Dim compressed_due As PamfMuxStream = Nothing
+            Dim compressed_urg As Long = Long.MaxValue
+            Dim lpcm_s As PamfMuxStream = Nothing
+            Dim lpcm_key As Long = Long.MaxValue
+            Dim audio_any As PamfMuxStream = Nothing
+            Dim audio_any_key As Long = Long.MaxValue
+
             For Each s In Streams
                 If s.AuQueue.Count = 0 Then Continue For
                 Dim head As AccessUnit = s.AuQueue.Peek()
-                Dim key As Long = head.Pts
-                ' only compressed audio (AT3+/AC-3) needs the pre-buffer lead
-                If s.IsAudio AndAlso s.Codec <> PamfStreamType.LPCM Then
-                    key -= AudioLeadTicks
-                End If
-                If key < bestKey Then
-                    bestKey = key
-                    best = s
+                If s.IsVideo Then
+                    If head.Pts < video_key Then
+                        video_key = head.Pts
+                        video_s = s
+                    End If
+                ElseIf s.Codec = PamfStreamType.LPCM Then
+                    If head.Pts < lpcm_key Then
+                        lpcm_key = head.Pts
+                        lpcm_s = s
+                    End If
+                    If head.Pts < audio_any_key Then
+                        audio_any_key = head.Pts
+                        audio_any = s
+                    End If
+                Else
+                    ' compressed (AT3+ / AC3)
+                    Dim urg As Long = head.Pts - scr - AudioTargetLeadTicks
+                    If urg < compressed_urg Then
+                        compressed_urg = urg
+                        If urg <= 0L Then compressed_due = s
+                    End If
+                    If head.Pts < audio_any_key Then
+                        audio_any_key = head.Pts
+                        audio_any = s
+                    End If
                 End If
             Next
-            Return best
+
+            ' force video to win the first pack
+            ' RAP marker + sys_header must ride the first pack.
+            If Not _firstVideoRapEmitted Then Return video_s
+
+            ' compressed audio past-due takes priority over everything
+            If compressed_due IsNot Nothing Then Return compressed_due
+
+            ' LPCM competes with video by PTS ordering
+            ' whichever is furthest behind on the playback timeline wins
+            If lpcm_s IsNot Nothing AndAlso video_s IsNot Nothing Then
+                If lpcm_key < video_key Then Return lpcm_s
+                Return video_s
+            End If
+            If lpcm_s IsNot Nothing Then Return lpcm_s     ' video queue drained
+            If video_s IsNot Nothing Then Return video_s
+
+            ' drain path when only compressed audio remains at end of file
+            Return audio_any
         End Function
 
         ' emit one PES for streams into the available sector space after the pack header
@@ -492,17 +693,10 @@ Namespace PamfMux
             '   - if the AU finishes with room left and the next AU fits,
             '     concatenate it into the same PES
             '   - any remaining bytes stuffed with 0xFF inside PES payload
-            Dim isFirstChunk As Boolean = (consumed = 0)
-            If isFirstChunk AndAlso au.IsRandomAccessPoint Then
-                s.EpEntries.Add(New EpEntry() With {
-                    .Pts = au.Pts,
-                    .ByteOffset = packStart - PayloadStartOffset
-                })
-            End If
-
             ' AU-start PES carries PTS+DTS+P-STD (13-byte extension, total 22B header)
             ' continuation PES carry no timestamps and no P-STD (0-byte extension, total 9B header)
             ' see WriteVideoPesHeaderContinuation
+            Dim isFirstChunk As Boolean = (consumed = 0)
             Dim hdrLen As Integer = If(isFirstChunk, VideoPesHeaderLen, VideoPesHeaderContinuationLen)
             Dim payloadFit As Integer = availBytes - hdrLen
             If payloadFit <= 0 Then
@@ -518,22 +712,60 @@ Namespace PamfMux
 
             ' multi-AU packing: only when current AU finishes here and next AU is a whole-fit
             ' do not split the second AU
+            '
+            ' never swallow an AU whose emit-index is a block-start (mod Ps2FramesPerBlock == 0)
+            ' those need their own pack so the ps2-emission branch in WritePackedStream runs at the top of that pack
+
             Dim extras As New List(Of AccessUnit)()
             Dim extrasBytes As Integer = 0
             If auFullyConsumed Then
                 Dim spare As Integer = payloadFit - chunkLen
+                Dim nextAuIdx As Integer = s.NextAuEmitIndex + 1  ' after the head we're finishing
                 While spare > 0
                     Dim n As AccessUnit = PeekAfterHead(s.AuQueue, extras.Count)
                     If n Is Nothing OrElse n.Data.Length > spare Then Exit While
+                    ' block boundary check: if adding this AU would swallow a block-start into the current pack, stop concatenation now
+                    If Ps2FramesPerBlock > 0 AndAlso s.IsVideo AndAlso s.Codec <> PamfStreamType.MPEG2Video Then
+                        If nextAuIdx Mod Ps2FramesPerBlock = 0 Then Exit While
+                    End If
                     extras.Add(n)
                     extrasBytes += n.Data.Length
                     spare -= n.Data.Length
+                    nextAuIdx += 1
                 End While
+            End If
+
+            ' partial-next-AU packing
+            '
+            ' after the whole-fit extras loop, if space still remains AND there's an AU that doesn't fit whole:
+            ' pack the START of that AU into the tail of this pack
+            '
+            ' the partial-next AU has no separate PTS/DTS in this PES
+            ' (H.222.6 permits multiple AUs sharing one PES header)
+            Dim partialNext As AccessUnit = Nothing
+            Dim partialNextBytes As Integer = 0
+            If auFullyConsumed Then
+                Dim spareAfterExtras As Integer = payloadFit - chunkLen - extrasBytes
+                If spareAfterExtras > 0 Then
+                    Dim n As AccessUnit = PeekAfterHead(s.AuQueue, extras.Count)
+                    If n IsNot Nothing AndAlso n.Data.Length > spareAfterExtras Then
+                        ' Same block boundary guard as extras above
+                        Dim nextAuIdxAfterExtras As Integer = s.NextAuEmitIndex + 1 + extras.Count
+                        Dim swallowsBlockStart As Boolean =
+                            (Ps2FramesPerBlock > 0 AndAlso s.IsVideo AndAlso
+                             s.Codec <> PamfStreamType.MPEG2Video AndAlso
+                             (nextAuIdxAfterExtras Mod Ps2FramesPerBlock) = 0)
+                        If Not swallowsBlockStart Then
+                            partialNext = n
+                            partialNextBytes = spareAfterExtras
+                        End If
+                    End If
+                End If
             End If
 
             ' size video PES to just the real AU content it carries
             ' any leftover sector space goes into a separate padding_stream packet (0xBE)
-            Dim actualPayload As Integer = chunkLen + extrasBytes
+            Dim actualPayload As Integer = chunkLen + extrasBytes + partialNextBytes
             Dim leftover As Integer = payloadFit - actualPayload
             Dim pesPayloadLen As Integer
             Dim inPesStuff As Integer
@@ -561,6 +793,9 @@ Namespace PamfMux
             For Each e In extras
                 out.Write(e.Data, 0, e.Data.Length)
             Next
+            If partialNext IsNot Nothing Then
+                out.Write(partialNext.Data, 0, partialNextBytes)
+            End If
             For i As Integer = 0 To inPesStuff - 1
                 out.WriteByte(&HFF)
             Next
@@ -569,13 +804,33 @@ Namespace PamfMux
             End If
 
             If auFullyConsumed Then
+                ' record where each of the first 4 AUs of the current block ends in the file 
+                ' capture the pack offset here and convert to sector delta in PatchAvcPs2AndEp
+                '
+                ' NextAuEmitIndex is the index of the AU we just fully wrote
+                ' (NextAuEmitIndex Mod N) is the frame position within the block after this dequeue:
+                ' 0 => we just wrote frame 0, etc
+                If _currentAvcBlockPatch IsNot Nothing AndAlso _currentAvcBlockPatch.FrameEndsRecorded < 4 Then
+                    _currentAvcBlockPatch.FrameEndPackOffsets(_currentAvcBlockPatch.FrameEndsRecorded) = packStart
+                    _currentAvcBlockPatch.FrameEndsRecorded += 1
+                End If
                 s.AuQueue.Dequeue()
                 s.NextAuEmitIndex += 1
                 _splitState.Remove(s.Index)
                 For Each e In extras
+                    ' extras are always fully contained within same pack, so they end in the same pack as the head AU we just recorded
+                    If _currentAvcBlockPatch IsNot Nothing AndAlso _currentAvcBlockPatch.FrameEndsRecorded < 4 Then
+                        _currentAvcBlockPatch.FrameEndPackOffsets(_currentAvcBlockPatch.FrameEndsRecorded) = packStart
+                        _currentAvcBlockPatch.FrameEndsRecorded += 1
+                    End If
                     s.AuQueue.Dequeue()
                     s.NextAuEmitIndex += 1
                 Next
+                ' partial-next AU is not dequeued
+                ' mark it as partially-consumed via _splitState so next video pack resumes at correct byte offset
+                If partialNext IsNot Nothing Then
+                    _splitState(s.Index) = partialNextBytes
+                End If
             Else
                 _splitState(s.Index) = consumed + chunkLen
             End If

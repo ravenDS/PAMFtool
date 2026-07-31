@@ -12,6 +12,10 @@ Namespace PamfMux
         Public Property TotalDuration90 As Long = 0
         Public Property StartPts90 As Long = 90000L      ' used by header start_pts
 
+        ' std_delay_bound written into PAMF header at offset 0x66 (u32, 1/90000 sec units).
+        ' 1.00 s (90000) when peak video bit rate <= 30 Mbps, 0.75 s (67500) when peak > 30 Mbps.
+        Public Property StdDelayBoundTicks As Integer = 90000
+
         ' when True, header is written without an EP (entry-point) seek table
         Public Property SkipEpTable As Boolean = False
 
@@ -150,7 +154,7 @@ Namespace PamfMux
             If Not SkipEpTable Then
                 For Each s In PsMuxer.Streams
                     For Each e In s.EpEntries
-                        HeaderWriter.AddEpEntry(e.Pts, e.ByteOffset)
+                        HeaderWriter.AddEpEntry(e)
                     Next
                 Next
             End If
@@ -158,7 +162,7 @@ Namespace PamfMux
             ' translate MuxRateBps -> PAMF header mux_rate field. same units as MPEG-2 PS pack header mux_rate (50 bytes/sec per unit)
             Dim muxRateUnits As Integer = CInt(CLng(PsMuxer.MuxRateBps) \ 8L \ 50L)
 
-            Dim hdr As Byte() = HeaderWriter.Build(CInt(numPacks), TotalDuration90, muxRateUnits)
+            Dim hdr As Byte() = HeaderWriter.Build(CInt(numPacks), TotalDuration90, muxRateUnits, StdDelayBoundTicks)
             If hdr.Length > Mpeg2PsPrimitives.SectorSize Then
                 Throw New InvalidOperationException(
                     "PAMF header (" & hdr.Length & " bytes) exceeds the reserved sector at file start.")
