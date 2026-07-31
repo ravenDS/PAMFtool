@@ -33,6 +33,11 @@ Supported streams:
 
 > [!TIP]
 > Mode is also auto-detected from the input file or folder.
+> 
+## Tested Games
+- Disney Sing It (AVC + AT3+)
+- Tears of Tiara (M2V + LPCM)
+- Michael Jackson: The Experience (AVC + AT3+, Stereo + 5.1, LPCM)
 
 ## Notes
 - While the demuxer is fully functional, the muxer is still experimental. `PAMF` files rebuilt with this tool work in all tested PS3 games so far.
