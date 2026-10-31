@@ -1,4 +1,4 @@
-' PAMFtool 1.2 - by ravenDS
+' PAMFtool 1.3 - by ravenDS
 ' github.com/ravenDS
 
 Imports System.IO
@@ -15,19 +15,16 @@ Module Program
         Dim forceDeblock As Boolean = False
         Dim forceNoDeblock As Boolean = False
         Dim noAtsc As Boolean = False
-        ' -pace <Mbps> : SCR advances at this rate instead of mux_rate (48 Mbps)
-        '                off (default) = SCR advances at MuxRateBps with AU-start anchoring to (video: DTS - 90000; audio: PTS - AudioTargetLeadTicks)
-        '                auto = derive from measured content bitrate)
-        '                <positive> = fixed pacing rate in Mbps
-        Dim paceMbps As Double = -1.0
+        ' -pace <v> : accepted for compatibility and ignored; packs follow Sony's buffer-model scheduler
+        Dim paceMbps As Double = Double.NaN
         ' -pstd <KB> : override AVC P-STD buffer size (KB)
         '              0 = use per-level default
         Dim overridePstdKb As Integer = 0
         ' -mmb <n> : override max_mean_bitrate in AVC codec_info byte 25
-        '            Sony encodes 11 for 1080p L4.1 CABAC and 5 for 720p L3.1 CAVLC, some games may inspect it
         Dim overrideMmb As Integer = -1
-        ' -ps2-block <N> : private_stream_2 cadence in AUs
-        '                  auto-detected, or manual override
+        ' -ps2-block <N> : minimum pictures between private_stream_2 / EP blocks
+        '                  (blocks always start at random access points)
+        '                  default -1 (0.4 s for AVC, every GOP for MPEG-2)
         Dim ps2FramesPerBlock As Integer = -1
         ' -muxrate <kbps> : override mux_rate (48000/24000/12000)
         '                   0 = leave at PsMuxer default (48000 kbps)
@@ -38,6 +35,8 @@ Module Program
         ' -initial-scr <ticks> : SCR value at pack 0, Sony uses either 30 or 30030 ("game" style, 0.67 s pre-roll)
         '                        use 30030 for game-content files where Sony schedules audio bursts at packs 1/4/10
         Dim overrideInitialScr As Long = -1L
+        ' -endsector : append a program_end_code sector after the last pack
+        Dim endSector As Boolean = False
         Dim i As Integer = 0
         While i < args.Length
             Dim a As String = args(i)
@@ -49,23 +48,13 @@ Module Program
                 Case "-deblock", "--deblock", "/deblock" : forceDeblock = True
                 Case "-nodeblock", "--nodeblock", "/nodeblock" : forceNoDeblock = True
                 Case "-noatsc", "--noatsc", "/noatsc" : noAtsc = True
+                Case "-endsector", "--endsector", "/endsector" : endSector = True
                 Case "-pace", "--pace", "/pace"
                     If i + 1 >= args.Length Then
                         Console.Error.WriteLine("Error: -pace requires a value in Mbps (e.g. -pace 7, or -pace auto, or -pace off).")
                         Environment.Exit(1)
                     End If
-                    Dim v As String = args(i + 1).ToLowerInvariant()
-                    Select Case v
-                        Case "auto" : paceMbps = 0.0
-                        Case "off", "none", "disable" : paceMbps = -1.0
-                        Case Else
-                            If Not Double.TryParse(v, System.Globalization.NumberStyles.Float,
-                                                   System.Globalization.CultureInfo.InvariantCulture, paceMbps) _
-                               OrElse paceMbps <= 0 Then
-                                Console.Error.WriteLine("Error: -pace value must be a positive number of Mbps, 'auto', or 'off'.")
-                                Environment.Exit(1)
-                            End If
-                    End Select
+                    paceMbps = 0.0     ' value ignored (see PamfMuxRunner)
                     i += 1
                 Case "-pstd", "--pstd", "/pstd"
                     If i + 1 >= args.Length OrElse Not Integer.TryParse(args(i + 1), overridePstdKb) _
@@ -83,8 +72,8 @@ Module Program
                     i += 1
                 Case "-ps2-block", "--ps2-block", "/ps2-block"
                     If i + 1 >= args.Length OrElse Not Integer.TryParse(args(i + 1), ps2FramesPerBlock) _
-                       OrElse ps2FramesPerBlock < 0 OrElse ps2FramesPerBlock > 255 Then
-                        Console.Error.WriteLine("Error: -ps2-block requires a value 0..255 (12/29/10 for Sony PAMFs, 0 = legacy 4-byte marker).")
+                       OrElse ps2FramesPerBlock < 0 OrElse ps2FramesPerBlock > PamfMux.Mpeg2PsMuxer.MaxPs2Pictures Then
+                        Console.Error.WriteLine($"Error: -ps2-block requires a value 1..{PamfMux.Mpeg2PsMuxer.MaxPs2Pictures} (minimum pictures per block).")
                         Environment.Exit(1)
                     End If
                     i += 1
@@ -116,7 +105,7 @@ Module Program
                 Case "-initial-scr", "--initial-scr", "/initial-scr"
                     Dim v As Long
                     If i + 1 >= args.Length OrElse Not Long.TryParse(args(i + 1), v) Then
-                        Console.Error.WriteLine("Error: -initial-scr requires a value in 90 kHz ticks (typical 30 or 30030).")
+                        Console.Error.WriteLine("Error: -initial-scr requires a value in 90 kHz ticks (0 / 30000, or the old 30 / 30030).")
                         Environment.Exit(1)
                     End If
                     If v < 0L OrElse v > 90000L Then
@@ -157,7 +146,7 @@ Module Program
             End If
             PamfMuxRunner.Run(positional, noEp, forceDeblock, forceNoDeblock, noAtsc, paceMbps,
                               overridePstdKb, overrideMmb, ps2FramesPerBlock, overrideMuxRateBps,
-                              overrideStdDelayTicks, overrideInitialScr)
+                              overrideStdDelayTicks, overrideInitialScr, endSector)
             Return
         End If
 
@@ -178,35 +167,34 @@ Module Program
     End Function
 
     Private Sub PrintUsage()
-        Console.WriteLine("PAMFtool v1.2 - github.com/ravenDS/PAMFtool")
+        Console.WriteLine("PAMFtool v1.3 - github.com/ravenDS/PAMFtool")
         Console.WriteLine("PlayStation Advanced Movie Format (PAMF) Muxer/Demuxer")
         Console.WriteLine()
         Console.WriteLine("Demux:  PAMFtool [-demux] <input.pamf> [outDir] [-info]")
         Console.WriteLine("Mux:    PAMFtool [-mux]   <inputDir>   [output.pamf] [-noep] [-noatsc]")
-        Console.WriteLine("        [-deblock | -nodeblock] [-pace <Mbps>] [-pstd <KB>] [-mmb <n>]")
-        Console.WriteLine("        [-ps2-block <N>] [-muxrate <kbps>]")
+        Console.WriteLine("        [-deblock | -nodeblock] [-pstd <KB>] [-mmb <n>] [-ps2-block <N>]")
+        Console.WriteLine("        [-muxrate <kbps>] [-std-delay <ticks>] [-initial-scr <ticks>] [-endsector]")
         Console.WriteLine()
         Console.WriteLine("Mux parameters:")
-        Console.WriteLine("  -noep            Skip writing an entry-point seek table in the header.")
+        Console.WriteLine("  -noep            Skip writing the entry-point (EP) seek tables in the header.")
         Console.WriteLine("  -noatsc          Ignore any 'atsc' RIFF chunk in .at3 inputs.")
-        Console.WriteLine("  -deblock         Force codec-info deblock byte to 1 (overrides PPS-derived value).")
-        Console.WriteLine("  -nodeblock       Force codec-info deblock byte to 0 (overrides PPS-derived value).")
-        Console.WriteLine("  -pace <v>        Set SCR pacing rate. Default: off (SCR advances at mux_rate).")
-        Console.WriteLine("                      <v> = <Mbps>  Fixed rate")
-        Console.WriteLine("                      <v> = auto    Compute from measured content bitrate")
-        Console.WriteLine("                      <v> = off     Advance SCR at mux_rate (default)")
-        Console.WriteLine("  -pstd <KB>       Override AVC P-STD buffer size in KB (1..8191).")
-        Console.WriteLine("                      Default is per-level (1505 for L3.1, 3703 for L4.1, etc).")
-        Console.WriteLine("  -mmb <n>         Override max_mean_bitrate byte in AVC codec_info (0..255).")
+        Console.WriteLine("  -deblock         Force codec-info deblock flag to 1 (default: 1 if any slice uses the filter).")
+        Console.WriteLine("  -nodeblock       Force codec-info deblock flag to 0.")
+        Console.WriteLine("  -pstd <KB>       Force the video P-STD buffer size in KB (1..8191).")
+        Console.WriteLine("                      Default: from the AVC HRD cpb_size / MPEG-2 vbv_buffer_size")
+        Console.WriteLine("                      (level table when the SPS has no HRD).")
+        Console.WriteLine("  -mmb <n>         Override max_mean_bitrate byte in AVC codec_info (0..255; default: from the AU sizes).")
         Console.WriteLine("                      Usually 11 for 1080p L4.1 CABAC, 5 for 720p L3.1 CAVLC.")
-        Console.WriteLine("  -ps2-block <N>   private_stream_2 marker cadence in AUs.")
-        Console.WriteLine("  -muxrate <kbps>  Override pack_header mux_rate. Per Sony PAMF Tools spec,")
-        Console.WriteLine("                      48000 (default), 24000, or 12000 are valid.")
-        Console.WriteLine("  -std-delay <tk>  Override std_delay_bound (u32 at header 0x66).")
+        Console.WriteLine("  -ps2-block <N>   Minimum pictures between ps2/EP blocks (1..492). Blocks always")
+        Console.WriteLine("                      start at random access points. Default: 0.4 s (AVC), every GOP (MPEG-2).")
+        Console.WriteLine("  -muxrate <kbps>  Pack mux_rate: 48000 (default), 24000 or 12000.")
+        Console.WriteLine("  -std-delay <tk>  std_delay_bound (u32 at header 0x66) and scheduler lead limit:")
         Console.WriteLine("                      90000 (1.00 s) when peak <= 30 Mbps")
         Console.WriteLine("                      67500 (0.75 s) when > 30 Mbps. Auto-detected from AVC HRD")
-        Console.WriteLine("  -initial-scr <tk>  Override SCR value at pack 0 (auto-detected)")
-        Console.WriteLine("                     default: 30 for AVC High profile, 30030 for AVC Main/M2V")
+        Console.WriteLine("  -initial-scr <tk> SCR origin: pack 0 SCR = origin + whole packs. Default: 0 for AVC")
+        Console.WriteLine("                      High profile, 30000 otherwise (30 / 30030 accepted as 0 / 30000).")
+        Console.WriteLine("  -endsector       Append a 2048-byte sector with MPEG_program_end_code after the last pack")
+        Console.WriteLine("                      (counted in the header's data sectors). Default: off.")
         Console.WriteLine()
         Console.WriteLine("Additional parameters:")
         Console.WriteLine("  -info       Print info on PAMF file & streams.")

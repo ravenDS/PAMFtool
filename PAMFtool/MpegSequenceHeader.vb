@@ -12,6 +12,11 @@ Public Class M2vSequenceInfo
     Public Property FrameRateExtN As Byte
     Public Property FrameRateExtD As Byte
     Public Property HasExtension As Boolean
+    ' vbv_buffer_size (16 kbit units) = vbv_buffer_size_value | vbv_buffer_size_extension << 10
+    ' Sony's P-STD for MPEG-2 video = ceil((vbv_buffer_size * 2048 + 40960) / 1024) KB
+    Public Property VbvBufferSize As Integer
+    Public Property BitRateValue As Integer          ' 400 bit/s units (with bit_rate_extension << 18)
+    Public Property LowDelay As Boolean
 
     ' PAMF muxer forwards them from bitstream when colour_description_flag = 1
     Public Property HasDisplayExtension As Boolean
@@ -142,6 +147,10 @@ Friend Module MpegSequenceHeaderParser
         Dim vSize As Integer = ((b1 And &HF) << 8) Or b2
         Dim aspect As Integer = b3 >> 4
         Dim frc As Integer = b3 And &HF
+        ' bytes 4..7: bit_rate_value (18) | marker (1) | vbv_buffer_size_value (10) | constrained (1) | ...
+        Dim w As Long = (CLng(buf(p + 4)) << 24) Or (CLng(buf(p + 5)) << 16) Or (CLng(buf(p + 6)) << 8) Or buf(p + 7)
+        Dim bitRate As Integer = CInt((w >> 14) And &H3FFFFL)
+        Dim vbv As Integer = CInt((w >> 3) And &H3FFL)
 
         Dim info As New M2vSequenceInfo() With {
             .WidthPixels = hSize,
@@ -149,7 +158,9 @@ Friend Module MpegSequenceHeaderParser
             .AspectRatioInfo = CByte(aspect),
             .FrameRateCode = CByte(frc),
             .ProgressiveSequence = True,    ' default; will be overridden by ext
-            .HasExtension = False
+            .HasExtension = False,
+            .VbvBufferSize = vbv,
+            .BitRateValue = bitRate
         }
         Return info
     End Function
@@ -184,10 +195,12 @@ Friend Module MpegSequenceHeaderParser
         info.ChromaFormat = CByte(br.U(2))
         Dim hExt As Integer = br.U(2)
         Dim vExt As Integer = br.U(2)
-        br.U(12)                                   ' bit_rate_extension
+        Dim brExt As Integer = br.U(12)            ' bit_rate_extension
         br.U(1)                                    ' marker_bit
-        br.U(8)                                    ' vbv_buffer_size_extension
-        br.U(1)                                    ' low_delay
+        Dim vbvExt As Integer = br.U(8)            ' vbv_buffer_size_extension
+        info.LowDelay = (br.U(1) <> 0)             ' low_delay
+        info.VbvBufferSize = info.VbvBufferSize Or (vbvExt << 10)
+        info.BitRateValue = info.BitRateValue Or (brExt << 18)
         info.FrameRateExtN = CByte(br.U(2))
         info.FrameRateExtD = CByte(br.U(5))
 

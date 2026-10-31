@@ -1,20 +1,22 @@
 ' H264Sps.vb - github.com/ravenDS/PAMFtool
 
-' H.264 SPS (Sequence Parameter Set) parser
-' decode the SPS including the VUI timing fields
-' frame rate = time_scale / (2 * num_units_in_tick) -> ITU-T H.264 spec
+' H.264 SPS/PPS parsers (refs: ITU-T H.264 7.3.2.1.1 / 7.3.2.2, VUI per Annex E)
+' frame rate = time_scale / (2 * num_units_in_tick)
 
 Public Class H264SpsInfo
+    Public Property SpsId As Integer
     Public Property WidthPixels As Integer
     Public Property HeightPixels As Integer
     Public Property ProfileIdc As Byte
     Public Property LevelIdc As Byte
+    Public Property ConstraintFlags As Byte
     Public Property FrameMbsOnlyFlag As Boolean   ' True = progressive
+    Public Property MbAdaptiveFrameFieldFlag As Boolean
     Public Property HasVuiTiming As Boolean
     Public Property NumUnitsInTick As UInteger
     Public Property TimeScale As UInteger
     Public Property FixedFrameRate As Boolean
-    ' SPS frame-cropping rectangle (in chroma 4:2:0 units, as encoded in SPS)
+    ' SPS frame-cropping rectangle (in crop units, as encoded in SPS)
     Public Property FrameCropLeftOffset As Integer
     Public Property FrameCropRightOffset As Integer
     Public Property FrameCropTopOffset As Integer
@@ -31,18 +33,38 @@ Public Class H264SpsInfo
     Public Property TransferCharacteristics As Byte  ' 1 = BT.709
     Public Property MatrixCoefficients As Byte    ' 1 = BT.709
 
-    ' std_delay_bound is varying with peak video bit rate
-    ' (1.00 s if peak <= 30 Mbps, 0.75 s if > 30 Mbps).
-    ' peak comes from HRD when the encoder wrote a full VUI, otherwise callers fall back to conservative defaults
+    ' HRD (when the encoder wrote one): peak bit rate and the coded picture buffer size
+    ' std_delay_bound follows peak (1.00 s if peak <= 30 Mbps, 0.75 s above)
+    ' P-STD buffer follows CPB size: ceil((cpb_size / 8 + 40960) / 1024) KB
     Public Property HasHrdParameters As Boolean
     Public Property HrdPeakBitrateBps As Long    ' 0 if HRD absent
+    Public Property NalHrdCpbSizeBits As Long    ' 0 if NAL HRD absent (largest SchedSelIdx)
+    Public Property VclHrdCpbSizeBits As Long    ' 0 if VCL HRD absent
+    Public Property PicStructPresentFlag As Boolean
+    Public Property HasBitstreamRestriction As Boolean
+    Public Property MaxNumReorderFrames As Integer = -1
+    Public Property MaxDecFrameBuffering As Integer = -1
+    Public Property VuiParseFailed As Boolean
 
-    ' fields the slice-header parser needs
+    ' fields the slice-header/POC code needs
+    Public Property ChromaFormatIdc As Integer = 1
+    Public Property SeparateColourPlaneFlag As Boolean
+    Public Property BitDepthLumaMinus8 As Integer
+    Public Property BitDepthChromaMinus8 As Integer
     Public Property Log2MaxFrameNumMinus4 As Byte
     Public Property PicOrderCntType As Byte
     Public Property Log2MaxPicOrderCntLsbMinus4 As Byte
     Public Property DeltaPicOrderAlwaysZeroFlag As Boolean
-    Public Property SeparateColourPlaneFlag As Boolean
+    Public Property OffsetForNonRefPic As Integer
+    Public Property OffsetForTopToBottomField As Integer
+    Public Property OffsetForRefFrame As Integer() = Array.Empty(Of Integer)()
+    Public Property MaxNumRefFrames As Integer
+
+    Public ReadOnly Property ChromaArrayType As Integer
+        Get
+            Return If(SeparateColourPlaneFlag, 0, ChromaFormatIdc)
+        End Get
+    End Property
 
     Public ReadOnly Property FrameRate As Double
         Get
@@ -54,141 +76,111 @@ End Class
 
 Friend Module H264SpsParser
 
+    ' high-profile family: these profile_idc values carry chroma_format_idc, bit depths and scaling lists
+    Public Function IsHighProfileFamily(profileIdc As Integer) As Boolean
+        Select Case profileIdc
+            Case 100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135
+                Return True
+        End Select
+        Return False
+    End Function
+
     ' Scan Annex-B byte range for the first NAL with nal_unit_type = 7
     ' Returns Nothing if no SPS is found or if parsing bails out
     Public Function ParseFirstSps(buf As Byte(), off As Integer, length As Integer) As H264SpsInfo
-        Dim rbsp As Byte() = FindSpsRbsp(buf, off, length)
-        If rbsp Is Nothing Then Return Nothing
-        Dim unescaped() As Byte = StripEmulationPrevention(rbsp)
-        Try
-            Return ParseSpsRbsp(unescaped)
-        Catch
-            ' SPS contained something we couldn't parse, fall back to PAMF header
-            Return Nothing
-        End Try
-    End Function
-
-    ' Locate the SPS NAL payload, return bytes after 1-byte NAL header 
-    Private Function FindSpsRbsp(buf As Byte(), off As Integer, length As Integer) As Byte()
         Dim [end] As Integer = Math.Min(buf.Length, off + length)
-        Dim i As Integer = off
-        While i < [end] - 4
-            ' match 0x000001 or 0x00000001 then check nal_unit_type
-            Dim nalHdrAt As Integer = -1
-            If buf(i) = 0 AndAlso buf(i + 1) = 0 Then
-                If buf(i + 2) = 1 Then
-                    nalHdrAt = i + 3
-                ElseIf buf(i + 2) = 0 AndAlso i + 3 < [end] AndAlso buf(i + 3) = 1 Then
-                    nalHdrAt = i + 4
-                End If
+        Dim nal As NalSpan
+        Dim p As Integer = off
+        While NextNal(buf, p, [end], nal)
+            If (buf(nal.Header) And &H1F) = 7 Then
+                Return ParseSpsNal(buf, nal.Header, nal.PayloadEnd)
             End If
-
-            If nalHdrAt >= 0 AndAlso nalHdrAt < [end] Then
-                Dim nalType As Integer = buf(nalHdrAt) And &H1F
-                If nalType = 7 Then
-                    ' RBSP runs until the next start code (or EOB)
-                    Dim s As Integer = nalHdrAt + 1
-                    Dim e As Integer = s
-                    While e < [end] - 2
-                        If buf(e) = 0 AndAlso buf(e + 1) = 0 _
-                        AndAlso (buf(e + 2) = 1 _
-                                 OrElse (buf(e + 2) = 0 AndAlso e + 3 < [end] AndAlso buf(e + 3) = 1)) Then
-                            Exit While
-                        End If
-                        e += 1
-                    End While
-                    Dim outBuf(e - s - 1) As Byte
-                    Array.Copy(buf, s, outBuf, 0, e - s)
-                    Return outBuf
-                End If
-                i = nalHdrAt + 1
-            Else
-                i += 1
-            End If
+            p = nal.PayloadEnd
         End While
         Return Nothing
     End Function
 
-    ' strip 0x000000 / 0x000001 / 0x000002 / 0x000003 before bit-parsing
-    Private Function StripEmulationPrevention(rbsp As Byte()) As Byte()
-        Dim outList As New List(Of Byte)(rbsp.Length)
-        Dim i As Integer = 0
-        While i < rbsp.Length
-            If i + 2 < rbsp.Length _
-            AndAlso rbsp(i) = 0 AndAlso rbsp(i + 1) = 0 AndAlso rbsp(i + 2) = 3 Then
-                outList.Add(0) : outList.Add(0)
-                i += 3
-            Else
-                outList.Add(rbsp(i))
-                i += 1
-            End If
-        End While
-        Return outList.ToArray()
+    ' nalHeader = index of the NAL header byte, nalEnd = end of the NAL payload
+    Public Function ParseSpsNal(buf As Byte(), nalHeader As Integer, nalEnd As Integer) As H264SpsInfo
+        Try
+            Return ParseSpsRbsp(Unescape(buf, nalHeader + 1, nalEnd))
+        Catch
+            Return Nothing
+        End Try
     End Function
 
+    Private Sub SkipScalingList(br As RbspReader, size As Integer)
+        Dim lastScale As Integer = 8
+        Dim nextScale As Integer = 8
+        For j As Integer = 0 To size - 1
+            If nextScale <> 0 Then
+                Dim delta As Integer = br.Se()
+                nextScale = (lastScale + delta + 256) Mod 256
+            End If
+            If nextScale <> 0 Then lastScale = nextScale
+        Next
+    End Sub
+
     Private Function ParseSpsRbsp(rbsp As Byte()) As H264SpsInfo
-        Dim br As New BitReader(rbsp)
+        Dim br As New RbspReader(rbsp)
         Dim sps As New H264SpsInfo()
 
         sps.ProfileIdc = CByte(br.U(8))
-        br.U(8)                                              ' 6 constraint_set flags + 2 reserved
+        sps.ConstraintFlags = CByte(br.U(8))                 ' 6 constraint_set flags + 2 reserved
         sps.LevelIdc = CByte(br.U(8))
-        br.Ue()                                              ' seq_parameter_set_id
+        sps.SpsId = CInt(br.Ue())
 
-        ' high-profile family has chroma_format_idc, bit-depth, scaling lists
-        If sps.ProfileIdc = 100 OrElse sps.ProfileIdc = 110 _
-        OrElse sps.ProfileIdc = 122 OrElse sps.ProfileIdc = 244 _
-        OrElse sps.ProfileIdc = 44 OrElse sps.ProfileIdc = 83 _
-        OrElse sps.ProfileIdc = 86 OrElse sps.ProfileIdc = 118 _
-        OrElse sps.ProfileIdc = 128 OrElse sps.ProfileIdc = 138 _
-        OrElse sps.ProfileIdc = 139 OrElse sps.ProfileIdc = 134 _
-        OrElse sps.ProfileIdc = 135 Then
-            Dim chromaFormatIdc As UInteger = br.Ue()
-            If chromaFormatIdc = 3UI Then
-                sps.SeparateColourPlaneFlag = (br.U(1) <> 0UI)             ' separate_colour_plane_flag
+        If IsHighProfileFamily(sps.ProfileIdc) Then
+            sps.ChromaFormatIdc = CInt(br.Ue())
+            If sps.ChromaFormatIdc = 3 Then
+                sps.SeparateColourPlaneFlag = br.Flag()
             End If
-            br.Ue()                                           ' bit_depth_luma_minus8
-            br.Ue()                                           ' bit_depth_chroma_minus8
+            sps.BitDepthLumaMinus8 = CInt(br.Ue())
+            sps.BitDepthChromaMinus8 = CInt(br.Ue())
             br.U(1)                                           ' qpprime_y_zero_transform_bypass_flag
-            Dim seqScalingMatrixPresentFlag As UInteger = br.U(1)
-            If seqScalingMatrixPresentFlag <> 0UI Then
-                ' implement loop with se() deltas here
-                Throw New NotSupportedException("SPS scaling lists present")
+            If br.Flag() Then                                 ' seq_scaling_matrix_present_flag
+                Dim lists As Integer = If(sps.ChromaFormatIdc <> 3, 8, 12)
+                For i As Integer = 0 To lists - 1
+                    If br.Flag() Then                         ' seq_scaling_list_present_flag[i]
+                        SkipScalingList(br, If(i < 6, 16, 64))
+                    End If
+                Next
             End If
         End If
 
-        sps.Log2MaxFrameNumMinus4 = CByte(br.Ue() And &HFUI)      ' log2_max_frame_num_minus4
+        sps.Log2MaxFrameNumMinus4 = CByte(br.Ue() And &HFUI)
         Dim picOrderCntType As UInteger = br.Ue()
         sps.PicOrderCntType = CByte(picOrderCntType And &HFFUI)
         If picOrderCntType = 0UI Then
-            sps.Log2MaxPicOrderCntLsbMinus4 = CByte(br.Ue() And &HFUI)   ' log2_max_pic_order_cnt_lsb_minus4
+            sps.Log2MaxPicOrderCntLsbMinus4 = CByte(br.Ue() And &HFUI)
         ElseIf picOrderCntType = 1UI Then
-            sps.DeltaPicOrderAlwaysZeroFlag = (br.U(1) <> 0UI)   ' delta_pic_order_always_zero_flag
-            br.Se()                                              ' offset_for_non_ref_pic
-            br.Se()                                              ' offset_for_top_to_bottom_field
-            Dim numRefInPicOrder As UInteger = br.Ue()           ' num_ref_frames_in_pic_order_cnt_cycle
-            For i As Integer = 0 To CInt(numRefInPicOrder) - 1
-                br.Se()                                          ' offset_for_ref_frame(i)
+            sps.DeltaPicOrderAlwaysZeroFlag = br.Flag()
+            sps.OffsetForNonRefPic = br.Se()
+            sps.OffsetForTopToBottomField = br.Se()
+            Dim n As Integer = CInt(br.Ue())
+            If n > 255 Then Throw New InvalidOperationException("num_ref_frames_in_pic_order_cnt_cycle out of range")
+            Dim offs(n - 1) As Integer
+            For i As Integer = 0 To n - 1
+                offs(i) = br.Se()
             Next
+            sps.OffsetForRefFrame = offs
         End If
 
-        br.Ue()                                               ' max_num_ref_frames
+        sps.MaxNumRefFrames = CInt(br.Ue())
         br.U(1)                                               ' gaps_in_frame_num_value_allowed_flag
         Dim picWidthMbsMinus1 As UInteger = br.Ue()
         Dim picHeightMapUnitsMinus1 As UInteger = br.Ue()
-        Dim frameMbsOnly As UInteger = br.U(1)
-        sps.FrameMbsOnlyFlag = (frameMbsOnly <> 0UI)
-        If frameMbsOnly = 0UI Then
-            br.U(1)                                           ' mb_adaptive_frame_field_flag
+        sps.FrameMbsOnlyFlag = br.Flag()
+        If Not sps.FrameMbsOnlyFlag Then
+            sps.MbAdaptiveFrameFieldFlag = br.Flag()
         End If
         br.U(1)                                               ' direct_8x8_inference_flag
 
-        Dim frameCropping As UInteger = br.U(1)
         Dim cropLeft As UInteger = 0
         Dim cropRight As UInteger = 0
         Dim cropTop As UInteger = 0
         Dim cropBottom As UInteger = 0
-        If frameCropping <> 0UI Then
+        If br.Flag() Then                                     ' frame_cropping_flag
             cropLeft = br.Ue()
             cropRight = br.Ue()
             cropTop = br.Ue()
@@ -199,136 +191,133 @@ Friend Module H264SpsParser
         sps.FrameCropTopOffset = CInt(cropTop)
         sps.FrameCropBottomOffset = CInt(cropBottom)
 
-        ' pixel dimensions for crop, Chroma 4:2:0 assumed, for other chroma formats offsets scale differently
+        ' crop units: CropUnitX = SubWidthC, CropUnitY = SubHeightC * (2 - frame_mbs_only_flag)
+        ' (1 and 2 - frame_mbs_only_flag when ChromaArrayType = 0)
+        Dim subW As Integer = 1
+        Dim subH As Integer = 1
+        Select Case sps.ChromaArrayType
+            Case 1 : subW = 2 : subH = 2
+            Case 2 : subW = 2 : subH = 1
+        End Select
+        Dim cropUnitY As Integer = subH * If(sps.FrameMbsOnlyFlag, 1, 2)
         Dim mbW As Integer = CInt(picWidthMbsMinus1 + 1UI) * 16
         Dim mbH As Integer = CInt(picHeightMapUnitsMinus1 + 1UI) * 16
-        If Not sps.FrameMbsOnlyFlag Then mbH *= 2     ' field-coded: map units are pairs
-        sps.WidthPixels = mbW - CInt((cropLeft + cropRight) * 2UI)
-        sps.HeightPixels = mbH - CInt((cropTop + cropBottom) * 2UI _
-                                      * (If(sps.FrameMbsOnlyFlag, 1UI, 2UI)))
+        If Not sps.FrameMbsOnlyFlag Then mbH *= 2     ' field-coded: map units are MB pairs
+        sps.WidthPixels = mbW - CInt(cropLeft + cropRight) * subW
+        sps.HeightPixels = mbH - CInt(cropTop + cropBottom) * cropUnitY
 
-        Dim vuiPresent As UInteger = br.U(1)
-        If vuiPresent = 0UI Then Return sps     ' no VUI, no timing
+        If Not br.Flag() Then Return sps                      ' vui_parameters_present_flag
 
-        ' VUI parameters
-        If br.U(1) <> 0UI Then                       ' aspect_ratio_info_present_flag
-            Dim aspectIdc As UInteger = br.U(8)      ' aspect_ratio_idc
+        ' a damaged / truncated VUI must not throw away the SPS fields above
+        Try
+            ParseVui(br, sps)
+        Catch
+            sps.VuiParseFailed = True
+        End Try
+        Return sps
+    End Function
+
+    Private Sub ParseVui(br As RbspReader, sps As H264SpsInfo)
+        If br.Flag() Then                            ' aspect_ratio_info_present_flag
+            Dim aspectIdc As UInteger = br.U(8)
             sps.AspectRatioIdc = CByte(aspectIdc)
-            If aspectIdc = 255UI Then                ' extended_SAR
+            If aspectIdc = 255UI Then                ' Extended_SAR
                 sps.SarWidth = CInt(br.U(16))
                 sps.SarHeight = CInt(br.U(16))
             End If
         End If
-        If br.U(1) <> 0UI Then br.U(1)               ' overscan_info_present + overscan_appropriate
-        If br.U(1) <> 0UI Then                       ' video_signal_type_present_flag
+        If br.Flag() Then br.U(1)                    ' overscan_info_present_flag + overscan_appropriate_flag
+        If br.Flag() Then                            ' video_signal_type_present_flag
             sps.HasVideoSignalInfo = True
             sps.VideoFormat = CByte(br.U(3))
             sps.VideoFullRangeFlag = CByte(br.U(1))
-            If br.U(1) <> 0UI Then                   ' colour_description_present_flag
+            If br.Flag() Then                        ' colour_description_present_flag
                 sps.ColourPrimaries = CByte(br.U(8))
                 sps.TransferCharacteristics = CByte(br.U(8))
                 sps.MatrixCoefficients = CByte(br.U(8))
             End If
         End If
-        If br.U(1) <> 0UI Then                       ' chroma_loc_info_present_flag
+        If br.Flag() Then                            ' chroma_loc_info_present_flag
             br.Ue() : br.Ue()
         End If
-
-        If br.U(1) <> 0UI Then                       ' timing_info_present_flag
+        If br.Flag() Then                            ' timing_info_present_flag
             sps.HasVuiTiming = True
             sps.NumUnitsInTick = br.U(32)
             sps.TimeScale = br.U(32)
-            sps.FixedFrameRate = (br.U(1) <> 0UI)
+            sps.FixedFrameRate = br.Flag()
         End If
 
-        ' HRD parameters
-        ' we only need the peak bitrate so we skip cpb sizes and cbr flags
-        Dim nalHrdPresent As Boolean = (br.U(1) <> 0UI)
+        Dim nalHrd As Boolean = br.Flag()
         Dim peakBps As Long = 0
-        If nalHrdPresent Then peakBps = Math.Max(peakBps, ParseHrdParameters(br))
-        Dim vclHrdPresent As Boolean = (br.U(1) <> 0UI)
-        If vclHrdPresent Then peakBps = Math.Max(peakBps, ParseHrdParameters(br))
-        If nalHrdPresent OrElse vclHrdPresent Then
+        If nalHrd Then
+            Dim h As HrdInfo = ParseHrdParameters(br)
+            peakBps = Math.Max(peakBps, h.MaxBitRate)
+            sps.NalHrdCpbSizeBits = h.MaxCpbSizeBits
+        End If
+        Dim vclHrd As Boolean = br.Flag()
+        If vclHrd Then
+            Dim h As HrdInfo = ParseHrdParameters(br)
+            peakBps = Math.Max(peakBps, h.MaxBitRate)
+            sps.VclHrdCpbSizeBits = h.MaxCpbSizeBits
+        End If
+        If nalHrd OrElse vclHrd Then
             sps.HasHrdParameters = True
             sps.HrdPeakBitrateBps = peakBps
+            br.U(1)                                  ' low_delay_hrd_flag
         End If
+        sps.PicStructPresentFlag = br.Flag()
+        If br.Flag() Then                            ' bitstream_restriction_flag
+            sps.HasBitstreamRestriction = True
+            br.U(1)                                  ' motion_vectors_over_pic_boundaries_flag
+            br.Ue()                                  ' max_bytes_per_pic_denom
+            br.Ue()                                  ' max_bits_per_mb_denom
+            br.Ue()                                  ' log2_max_mv_length_horizontal
+            br.Ue()                                  ' log2_max_mv_length_vertical
+            sps.MaxNumReorderFrames = CInt(br.Ue())
+            sps.MaxDecFrameBuffering = CInt(br.Ue())
+        End If
+    End Sub
 
-        Return sps
-    End Function
+    Private Structure HrdInfo
+        Public MaxBitRate As Long
+        Public MaxCpbSizeBits As Long
+    End Structure
 
-    ' parse hrd_parameters() and return the peak bitrate across all schedSelIdx
-    ' peak formula:
-    ' bitRate[i] = (bit_rate_value_minus1[i] + 1)* 2^(6 + bit_rate_scale) bps
-    Private Function ParseHrdParameters(br As BitReader) As Long
+    ' hrd_parameters() (E.1.2):
+    '   bitRate[i] = (bit_rate_value_minus1[i] + 1) * 2^(6 + bit_rate_scale)       bit/s
+    '   cpbSize[i] = (cpb_size_value_minus1[i] + 1) * 2^(4 + cpb_size_scale)       bits
+    Private Function ParseHrdParameters(br As RbspReader) As HrdInfo
         Dim cpbCntMinus1 As UInteger = br.Ue()
-        Dim bitRateScale As UInteger = br.U(4)
-        Dim cpbSizeScale As UInteger = br.U(4)
-        Dim maxBps As Long = 0
+        If cpbCntMinus1 > 31UI Then Throw New InvalidOperationException("cpb_cnt_minus1 out of range")
+        Dim bitRateScale As Integer = CInt(br.U(4))
+        Dim cpbSizeScale As Integer = CInt(br.U(4))
+        Dim r As New HrdInfo()
         For i As UInteger = 0UI To cpbCntMinus1
-            Dim brValue As UInteger = br.Ue()  ' bit_rate_value_minus1[i]
-            Dim cpbSize As UInteger = br.Ue()  ' cpb_size_value_minus1[i] (unused)
-            br.U(1)                            ' cbr_flag[i] (unused)
-            Dim bps As Long = CLng(brValue + 1UI) << CInt(6 + bitRateScale)
-            If bps > maxBps Then maxBps = bps
+            Dim brValue As Long = CLng(br.Ue()) + 1L
+            Dim cpbValue As Long = CLng(br.Ue()) + 1L
+            br.U(1)                            ' cbr_flag[i]
+            r.MaxBitRate = Math.Max(r.MaxBitRate, brValue << (6 + bitRateScale))
+            r.MaxCpbSizeBits = Math.Max(r.MaxCpbSizeBits, cpbValue << (4 + cpbSizeScale))
         Next
         br.U(5)     ' initial_cpb_removal_delay_length_minus1
         br.U(5)     ' cpb_removal_delay_length_minus1
         br.U(5)     ' dpb_output_delay_length_minus1
         br.U(5)     ' time_offset_length
-        Return maxBps
+        Return r
     End Function
-
-    Private Class BitReader
-        Private ReadOnly _data As Byte()
-        Private _pos As Integer
-        Public Sub New(data As Byte())
-            _data = data
-            _pos = 0
-        End Sub
-
-        Public Function U(n As Integer) As UInteger
-            Dim v As UInteger = 0UI
-            For i As Integer = 0 To n - 1
-                If _pos >= _data.Length * 8 Then
-                    Throw New InvalidOperationException("BitReader past end of buffer")
-                End If
-                Dim bit As Integer = (_data(_pos >> 3) >> (7 - (_pos And 7))) And 1
-                v = (v << 1) Or CUInt(bit)
-                _pos += 1
-            Next
-            Return v
-        End Function
-
-        Public Function Ue() As UInteger
-            Dim zeros As Integer = 0
-            While U(1) = 0UI
-                zeros += 1
-                If zeros > 32 Then
-                    Throw New InvalidOperationException("Exp-Golomb code too large")
-                End If
-            End While
-            If zeros = 0 Then Return 0UI
-            Return (CUInt(1) << zeros) - 1UI + U(zeros)
-        End Function
-
-        Public Function Se() As Integer
-            Dim v As UInteger = Ue()
-            If (v And 1UI) = 0UI Then
-                Return -CInt(v >> 1)
-            Else
-                Return CInt((v + 1UI) >> 1)
-            End If
-        End Function
-    End Class
 
 End Module
 
-' PPS parsing (entropy_coding_mode + deblocking_filter_control)
+' PPS parsing (entropy_coding_mode + deblocking_filter_control + everything the slice header needs)
 Public Class H264PpsInfo
+    Public Property PpsId As Integer
+    Public Property SpsId As Integer
     Public Property CabacFlag As Boolean
     Public Property DeblockingFilterControlPresent As Boolean
     ' fields the slice-header parser needs
     Public Property BottomFieldPicOrderInFramePresentFlag As Boolean
+    Public Property NumSliceGroupsMinus1 As Integer
+    Public Property SliceGroupMapType As Integer
     Public Property NumRefIdxL0DefaultActiveMinus1 As Byte
     Public Property NumRefIdxL1DefaultActiveMinus1 As Byte
     Public Property WeightedPredFlag As Boolean
@@ -339,89 +328,48 @@ End Class
 Friend Module H264PpsParser
 
     Public Function ParseFirstPps(buf As Byte(), off As Integer, length As Integer) As H264PpsInfo
-        Dim rbsp As Byte() = FindPpsRbsp(buf, off, length)
-        If rbsp Is Nothing Then Return Nothing
-        Dim unesc As Byte() = StripEpb(rbsp)
+        Dim [end] As Integer = Math.Min(buf.Length, off + length)
+        Dim nal As NalSpan
+        Dim p As Integer = off
+        While NextNal(buf, p, [end], nal)
+            If (buf(nal.Header) And &H1F) = 8 Then
+                Return ParsePpsNal(buf, nal.Header, nal.PayloadEnd)
+            End If
+            p = nal.PayloadEnd
+        End While
+        Return Nothing
+    End Function
+
+    Public Function ParsePpsNal(buf As Byte(), nalHeader As Integer, nalEnd As Integer) As H264PpsInfo
         Try
-            Return ParsePpsRbsp(unesc)
+            Return ParsePpsRbsp(Unescape(buf, nalHeader + 1, nalEnd))
         Catch
             Return Nothing
         End Try
     End Function
 
-    Private Function FindPpsRbsp(buf As Byte(), off As Integer, length As Integer) As Byte()
-        Dim [end] As Integer = Math.Min(buf.Length, off + length)
-        Dim i As Integer = off
-        While i < [end] - 4
-            If buf(i) = 0 AndAlso buf(i + 1) = 0 Then
-                Dim scLen As Integer = 0
-                If buf(i + 2) = 1 Then
-                    scLen = 3
-                ElseIf buf(i + 2) = 0 AndAlso i + 3 < [end] AndAlso buf(i + 3) = 1 Then
-                    scLen = 4
-                End If
-                If scLen > 0 Then
-                    Dim nalStart As Integer = i + scLen
-                    Dim nalType As Integer = buf(nalStart) And &H1F
-                    If nalType = 8 Then    ' PPS
-                        Dim nalEnd As Integer = nalStart + 1
-                        While nalEnd < [end] - 2
-                            If buf(nalEnd) = 0 AndAlso buf(nalEnd + 1) = 0 AndAlso
-                               (buf(nalEnd + 2) = 1 OrElse
-                                (buf(nalEnd + 2) = 0 AndAlso nalEnd + 3 < [end] AndAlso buf(nalEnd + 3) = 1)) Then
-                                Exit While
-                            End If
-                            nalEnd += 1
-                        End While
-                        Dim rbsp(nalEnd - (nalStart + 1) - 1) As Byte
-                        Array.Copy(buf, nalStart + 1, rbsp, 0, rbsp.Length)
-                        Return rbsp
-                    End If
-                    i = nalStart
-                    Continue While
-                End If
-            End If
-            i += 1
-        End While
-        Return Nothing
-    End Function
-
-    Private Function StripEpb(rbsp As Byte()) As Byte()
-        Dim outList As New List(Of Byte)(rbsp.Length)
-        Dim i As Integer = 0
-        While i < rbsp.Length
-            If i + 2 < rbsp.Length AndAlso rbsp(i) = 0 AndAlso rbsp(i + 1) = 0 AndAlso rbsp(i + 2) = 3 Then
-                outList.Add(0) : outList.Add(0)
-                i += 3
-            Else
-                outList.Add(rbsp(i))
-                i += 1
-            End If
-        End While
-        Return outList.ToArray()
-    End Function
-
     Private Function ParsePpsRbsp(rbsp As Byte()) As H264PpsInfo
-        Dim br As New PpsBitReader(rbsp)
+        Dim br As New RbspReader(rbsp)
         Dim pps As New H264PpsInfo()
 
         ' ISO 14496-10 pic_parameter_set_rbsp():
-        br.Ue()    ' pic_parameter_set_id
-        br.Ue()    ' seq_parameter_set_id
-        pps.CabacFlag = (br.U(1) <> 0UI)              ' entropy_coding_mode_flag
-        pps.BottomFieldPicOrderInFramePresentFlag = (br.U(1) <> 0UI)
+        pps.PpsId = CInt(br.Ue())
+        pps.SpsId = CInt(br.Ue())
+        pps.CabacFlag = br.Flag()                         ' entropy_coding_mode_flag
+        pps.BottomFieldPicOrderInFramePresentFlag = br.Flag()
 
-        Dim numSliceGroupsMinus1 As UInteger = br.Ue()
-        If numSliceGroupsMinus1 > 0UI Then
+        pps.NumSliceGroupsMinus1 = CInt(br.Ue())
+        If pps.NumSliceGroupsMinus1 > 7 Then Throw New InvalidOperationException("num_slice_groups_minus1 out of range")
+        If pps.NumSliceGroupsMinus1 > 0 Then
             ' FMO
-            Dim sliceGroupMapType As UInteger = br.Ue()
-            Select Case CInt(sliceGroupMapType)
+            pps.SliceGroupMapType = CInt(br.Ue())
+            Select Case pps.SliceGroupMapType
                 Case 0
-                    For iGroup As Integer = 0 To CInt(numSliceGroupsMinus1)
+                    For iGroup As Integer = 0 To pps.NumSliceGroupsMinus1
                         br.Ue()    ' run_length_minus1[iGroup]
                     Next
                 Case 2
-                    For iGroup As Integer = 0 To CInt(numSliceGroupsMinus1) - 1
+                    For iGroup As Integer = 0 To pps.NumSliceGroupsMinus1 - 1
                         br.Ue()    ' top_left[iGroup]
                         br.Ue()    ' bottom_right[iGroup]
                     Next
@@ -430,70 +378,29 @@ Friend Module H264PpsParser
                     br.Ue()        ' slice_group_change_rate_minus1
                 Case 6
                     Dim picSizeInMapUnitsMinus1 As UInteger = br.Ue()
-                    ' slice_group_id(i) is u(v) where v = ceil(log2(numSG))
-                    Dim numGroups As UInteger = numSliceGroupsMinus1 + 1UI
+                    ' slice_group_id[i] is u(v) with v = Ceil(Log2(num_slice_groups_minus1 + 1))
                     Dim v As Integer = 0
-                    Dim tmp As UInteger = numGroups - 1UI
-                    While tmp > 0UI
+                    While (1 << v) < pps.NumSliceGroupsMinus1 + 1
                         v += 1
-                        tmp = tmp >> 1
                     End While
-                    If v = 0 Then v = 1
-                    For i As Integer = 0 To CInt(picSizeInMapUnitsMinus1)
-                        br.U(v)    ' slice_group_id[i]
+                    For i As Long = 0 To CLng(picSizeInMapUnitsMinus1)
+                        br.U(v)
                     Next
             End Select
         End If
 
         pps.NumRefIdxL0DefaultActiveMinus1 = CByte(br.Ue() And &H3FUI)
         pps.NumRefIdxL1DefaultActiveMinus1 = CByte(br.Ue() And &H3FUI)
-        pps.WeightedPredFlag = (br.U(1) <> 0UI)
+        pps.WeightedPredFlag = br.Flag()
         pps.WeightedBipredIdc = CByte(br.U(2) And 3UI)
         br.Se()    ' pic_init_qp_minus26
         br.Se()    ' pic_init_qs_minus26
         br.Se()    ' chroma_qp_index_offset
 
-        pps.DeblockingFilterControlPresent = (br.U(1) <> 0UI)
+        pps.DeblockingFilterControlPresent = br.Flag()
         br.U(1)    ' constrained_intra_pred_flag
-        pps.RedundantPicCntPresentFlag = (br.U(1) <> 0UI)
+        pps.RedundantPicCntPresentFlag = br.Flag()
         Return pps
     End Function
-
-    Private Class PpsBitReader
-        Private ReadOnly _data As Byte()
-        Private _pos As Integer
-        Public Sub New(data As Byte())
-            _data = data
-            _pos = 0
-        End Sub
-        Public Function U(n As Integer) As UInteger
-            Dim v As UInteger = 0UI
-            For i As Integer = 0 To n - 1
-                If _pos >= _data.Length * 8 Then Throw New InvalidOperationException("Past end")
-                Dim bit As Integer = (_data(_pos >> 3) >> (7 - (_pos And 7))) And 1
-                v = (v << 1) Or CUInt(bit)
-                _pos += 1
-            Next
-            Return v
-        End Function
-        Public Function Ue() As UInteger
-            Dim zeros As Integer = 0
-            While U(1) = 0UI
-                zeros += 1
-                If zeros > 32 Then Throw New InvalidOperationException("Exp-Golomb too large")
-            End While
-            If zeros = 0 Then Return 0UI
-            Return (CUInt(1) << zeros) - 1UI + U(zeros)
-        End Function
-
-        Public Function Se() As Integer
-            Dim v As UInteger = Ue()
-            If (v And 1UI) = 0UI Then
-                Return -CInt(v >> 1)
-            Else
-                Return CInt((v + 1UI) >> 1)
-            End If
-        End Function
-    End Class
 
 End Module

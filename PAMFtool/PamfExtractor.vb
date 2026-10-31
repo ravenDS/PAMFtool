@@ -335,9 +335,17 @@ Public Class PamfFile
         ' parse rest of header
         ParseGlobalHeaderFields(raw)
 
-        ' elementary mux begins at first 2048-byte sector
-        ' we find it by looking for first MPEG-PS pack header (00 00 01 BA)
-        StreamOffset = FindMpegPsStart(raw)
+        ' the program stream begins right after header sectors (u32 @ 0x08);
+        ' scanning for the first 00 00 01 BA is only a fallback, because an EP table can contain that byte pattern
+        ' (any entry with a PTS of 0x0001BAxx)
+        Dim declaredStart As Long = CLng(HeaderSectors) * SectorSize
+        If HeaderSectors > 0 AndAlso declaredStart + 4 <= raw.Length AndAlso
+           raw(CInt(declaredStart)) = 0 AndAlso raw(CInt(declaredStart) + 1) = 0 AndAlso
+           raw(CInt(declaredStart) + 2) = 1 AndAlso raw(CInt(declaredStart) + 3) = &HBA Then
+            StreamOffset = declaredStart
+        Else
+            StreamOffset = FindMpegPsStart(raw)
+        End If
         StreamSize = FileSize - StreamOffset
         HeaderSize = StreamOffset
 
