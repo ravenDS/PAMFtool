@@ -150,7 +150,7 @@ Friend Module PamfExtractRunner
         Console.WriteLine("    entropy_coding : " & s.CabacFlag &
                           " (" & If(s.CabacFlag = 1, "CABAC", "CAVLC") & ")")
         Console.WriteLine("    deblock_flag   : " & s.DeblockingFilterFlag &
-                          " (deblocking_filter_control_present_flag)")
+                          If(s.DeblockingFilterFlag = 1, " (deblocking on)", " (deblocking off)"))
         Console.WriteLine("    min_slice_idc  : " & s.MinNumSlicePerPictureIdc)
         Console.WriteLine("    nfw_idc        : " & s.NfwIdc)
         Console.WriteLine("    max_mean_bitrate: " & s.MaxMeanBitrate)

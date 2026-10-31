@@ -163,6 +163,45 @@ Namespace PamfMux
             out.WriteByte(&H0)      ' byte 8: header_data_length = 0
         End Sub
 
+        ' generic PES header (byte 6 is always 0x81 ???):
+        '   flags byte 7: 0x80 PTS, 0x40 DTS, 0x01 PES_extension (carrying P-STD_buffer only)
+        '   header_data: [PTS 5][DTS 5][0x1E, P-STD 2][stuffing 0xFF x n]
+        ' observed variants:
+        ' RAP video 81 C1 0D, mid-block video 81 C0 0A, B picture 81 80 05,continuation 81 00 00,
+        ' audio 81 81 08 / 81 80 05 / 81 01 03 / 81 00 00, plus 1..7 stuffing bytes
+        Public Function PesHeaderLength(hasPts As Boolean, hasDts As Boolean, hasPstd As Boolean, stuffing As Integer) As Integer
+            Return 9 + If(hasPts, 5, 0) + If(hasDts, 5, 0) + If(hasPstd, 3, 0) + stuffing
+        End Function
+
+        Public Sub WritePesHeader(out As Stream, streamId As Byte, payloadLen As Integer,
+                                  hasPts As Boolean, pts90 As Long,
+                                  hasDts As Boolean, dts90 As Long,
+                                  hasPstd As Boolean, pstdKb As Integer,
+                                  stuffing As Integer)
+            If hasDts AndAlso Not hasPts Then Throw New ArgumentException("DTS without PTS")
+            If stuffing < 0 OrElse stuffing > 32 Then Throw New ArgumentOutOfRangeException(NameOf(stuffing))
+            Dim hdrData As Integer = If(hasPts, 5, 0) + If(hasDts, 5, 0) + If(hasPstd, 3, 0) + stuffing
+            Dim pesLen As Integer = 3 + hdrData + payloadLen
+            If pesLen > &HFFFF Then Throw New ArgumentOutOfRangeException(NameOf(payloadLen))
+            out.WriteByte(0) : out.WriteByte(0) : out.WriteByte(1) : out.WriteByte(streamId)
+            out.WriteByte(CByte((pesLen >> 8) And &HFF))
+            out.WriteByte(CByte(pesLen And &HFF))
+            out.WriteByte(&H81)
+            out.WriteByte(CByte(If(hasPts, &H80, 0) Or If(hasDts, &H40, 0) Or If(hasPstd, &H1, 0)))
+            out.WriteByte(CByte(hdrData))
+            If hasPts Then WriteTimestamp5(out, pts90, prefix4Bits:=If(hasDts, 3, 2))
+            If hasDts Then WriteTimestamp5(out, dts90, prefix4Bits:=1)
+            If hasPstd Then
+                out.WriteByte(&H1E)                                ' P-STD_buffer_flag + reserved '111'
+                Dim sz As Integer = pstdKb And &H1FFF
+                out.WriteByte(CByte(&H40 Or &H20 Or ((sz >> 8) And &H1F)))   ' '01' + scale 1 (1024-byte units)
+                out.WriteByte(CByte(sz And &HFF))
+            End If
+            For i As Integer = 1 To stuffing
+                out.WriteByte(&HFF)
+            Next
+        End Sub
+
         ' audio PES header (14 bytes including sub-hdr space, PTS only)
 
         Public Sub WriteAudioPesHeader(out As Stream,

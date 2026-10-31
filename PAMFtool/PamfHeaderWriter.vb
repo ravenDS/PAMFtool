@@ -1,19 +1,23 @@
-﻿' PamfHeaderWriter.vb - github.com/ravenDS/PAMFtool
+' PamfHeaderWriter.vb - github.com/ravenDS/PAMFtool
 '
-' Build 2 KB PAMF header
+' Build PAMF header (one or more 2048-byte sectors)
 '
 ' Fields:
-'   +0x0C  u32  numPacks                                 = (filesize - 2048) / 2048
+'   +0x08  u32  header sectors                           (2 when the EP map does not fit one sector)
+'   +0x0C  u32  data sectors
 '   +0x50  u32  size A                                   = 0x64 + 0x30*(n-1)
-'   +0x5E  u32  duration_low                             (90 kHz ticks)
-'   +0x64  u16  mux_rate                                 (units of 50 bytes/sec)
+'   +0x56  u48  start_pts                                (90 kHz, 90000)
+'   +0x5C  u48  end_pts                                  (first video PTS + video duration)
+'   +0x62  u32  mux_rate_bound                           (units of 50 bytes/sec)
+'   +0x66  u32  std_delay_bound                          (90 kHz)
 '   +0x6D  u8   numStreams
 '   +0x70  u32  size B                                   = 0x44 + 0x30*(n-1)
-'   +0x7C  u32  duration_low (duplicate of +0x5E)
-'   +0x84  u16  size C                                   = 0x32 + 0x30*(n-1)
+'   +0x74  u48  start_pts (duplicate)
+'   +0x7A  u48  end_pts (duplicate)
+'   +0x82  u32  size C                                   = 0x32 + 0x30*(n-1)
 '   +0x87  u8   numStreams (duplicate of +0x6D)
 '   +0x88  ...  stream entries (48 bytes each) and codec info
-'   +...   ...  EP table (12 bytes per entry, 8-byte-aligned start)
+'   +...   ...  EP tables, one per video stream, 12 bytes per entry
 
 Namespace PamfMux
 
@@ -43,9 +47,7 @@ Namespace PamfMux
             &H0, &H1, &H0, &H0, &H0, &H32, &H0, &H1          ' 0x80: const, size C (n=1), n=1
         }
 
-        Private _header() As Byte
         Private _streams As New List(Of StreamEntry)()
-        Private _epEntries As New List(Of PamfMux.EpEntry)()
 
         Private Class StreamEntry
             Public StreamTypeByte As Byte
@@ -54,11 +56,8 @@ Namespace PamfMux
             Public SubStreamId As Byte
             Public PStdBufferRaw As UShort     ' packed P_STD buffer field for entry+6..7
             Public CodecInfo As Byte()
+            Public EpEntries As List(Of PamfMux.EpEntry)
         End Class
-
-        Public Sub New()
-            _header = New Byte(HeaderSize - 1) {}
-        End Sub
 
         ' Pack P_STD buffer: 2 unused bits, 1 scale bit, 13 size bits
         ' scale=0 means size is in 128-byte units, scale=1 means 1024-byte units
@@ -286,109 +285,111 @@ Namespace PamfMux
             })
         End Sub
 
-        ' add one EP entry, pass the mux EpEntry directly (rather than just PTS/offset)
-        ' so RefPictureEndSectors (populated by Mpeg2PsMuxer.PatchAvcPs2AndEp) is preserved
-        Public Sub AddEpEntry(entry As PamfMux.EpEntry)
-            _epEntries.Add(entry)
+        ' P-STD buffer size (1024-byte units) of stream i, as finally used by the muxer
+        Public Sub SetPstdKb(streamIndex As Integer, kb As Integer)
+            _streams(streamIndex).PStdBufferRaw = PackPStdBuffer(1, Math.Max(1, Math.Min(kb, &H1FFF)))
         End Sub
 
-        ' muxRateUnits is the value to write at offset 0x64, in MPEG-2 PS mux_rate convention (50 bytes/sec per unit)
-        ' for a 24 Mbps stream thats 24_000_000 / 8 / 50 = 60000 = 0xEA60
-        Public Function Build(numPacks As Integer, totalDuration90 As Long,
-                              muxRateUnits As Integer,
-                              Optional stdDelayBoundTicks As Integer = 90000) As Byte()
-            Array.Copy(TemplateBytes, _header, TemplateBytes.Length)
+        ' EP map of stream i (video streams only), Nothing/empty = no EP table for that stream
+        Public Sub SetEpEntries(streamIndex As Integer, entries As List(Of PamfMux.EpEntry))
+            _streams(streamIndex).EpEntries = entries
+        End Sub
+
+        Public ReadOnly Property StreamCount As Integer
+            Get
+                Return _streams.Count
+            End Get
+        End Property
+
+        ' bytes used by the header before rounding to whole sectors
+        Private Function UsedBytes() As Integer
+            Dim used As Integer = &H88 + _streams.Count * StreamEntrySize
+            For Each s In _streams
+                If s.EpEntries IsNot Nothing Then used += 12 * s.EpEntries.Count
+            Next
+            Return used
+        End Function
+
+        Public ReadOnly Property HeaderSectors As Integer
+            Get
+                Return (UsedBytes() + HeaderSize - 1) \ HeaderSize
+            End Get
+        End Property
+
+        ' muxRateUnits is the value to write at offset 0x62
+        ' in MPEG-2 PS mux_rate convention (50 bytes/sec per unit) for a 24 Mbps stream thats 24_000_000 / 8 / 50 = 60000 = 0xEA60
+        Public Function Build(dataSectors As Long, startPts90 As Long, endPts90 As Long,
+                              muxRateUnits As Integer, stdDelayBoundTicks As Long) As Byte()
+            Dim sectors As Integer = HeaderSectors
+            Dim header(sectors * HeaderSize - 1) As Byte
+            Array.Copy(TemplateBytes, header, TemplateBytes.Length)
             Dim n As Integer = _streams.Count
-            WriteU32BE(_header, &HC, CUInt(numPacks))
-            WriteU32BE(_header, &H50, CUInt(&H64 + &H30 * (n - 1)))
-            WriteU32BE(_header, &H70, CUInt(&H44 + &H30 * (n - 1)))
-            Dim durLow As UInteger = CUInt(totalDuration90 And &HFFFFFFFFL)
-            WriteU32BE(_header, &H5E, durLow)
-            WriteU32BE(_header, &H7C, durLow)
+            WriteU32BE(header, &H8, CUInt(sectors))
+            WriteU32BE(header, &HC, CUInt(dataSectors))
+            WriteU32BE(header, &H50, CUInt(&H64 + &H30 * (n - 1)))
+            WriteU32BE(header, &H70, CUInt(&H44 + &H30 * (n - 1)))
+            WriteU48BE(header, &H56, startPts90)
+            WriteU48BE(header, &H5C, endPts90)
+            WriteU48BE(header, &H74, startPts90)
+            WriteU48BE(header, &H7A, endPts90)
             ' mux_rate_bound is u32 at 0x62
-            WriteU32BE(_header, &H62, CUInt(muxRateUnits And &HFFFFFFFFL))
+            WriteU32BE(header, &H62, CUInt(muxRateUnits And &HFFFFFFFFL))
             ' std_delay_bound is u32 at 0x66, in 1/90000 second units
             ' 1.00 sec (90000 ticks) when peak <= 30 Mbps
             ' 0.75 sec (67500 ticks) when peak > 30 Mbps
-            WriteU32BE(_header, &H66, CUInt(stdDelayBoundTicks And &HFFFFFFFFL))
-            _header(&H6D) = CByte(n)
-            WriteU16BE(_header, &H84, CUShort(&H32 + &H30 * (n - 1)))
-            _header(&H87) = CByte(n)
-            BuildStreamEntries(n)
-            BuildEpTable(n)
-            Return _header
+            WriteU32BE(header, &H66, CUInt(stdDelayBoundTicks And &HFFFFFFFFL))
+            header(&H6D) = CByte(n)
+            WriteU16BE(header, &H84, CUShort(&H32 + &H30 * (n - 1)))
+            header(&H87) = CByte(n)
+            BuildStreamEntriesAndEp(header)
+            Return header
         End Function
 
-        Private Sub BuildStreamEntries(n As Integer)
+        Private Sub BuildStreamEntriesAndEp(header As Byte())
             ' PamfStreamHeader layout:
             '   +0      stream_coding_type
             '   +1..+3  reserved (zeros)
             '   +4      stream_id (e.g. 0xE0 video, 0xBD private)
             '   +5      private_stream_id
             '   +6..+7  p_std_buffer (u16 BE, packed: 2 unused + 1 scale + 13 size)
-            '   +8..+11 ep_offset  (u32 BE, byte offset of EP table from header start, 0 if no EP table for this stream)
+            '   +8..+11 ep_offset  (u32 BE, byte offset of the stream's EP table from header start, 0 if none)
             '   +12..+15 ep_num    (u32 BE, count of EP entries)
             '   +16..+47 codec-specific info (32 bytes)
+            '
+            ' EP entry (12 bytes):
+            '   value0 (u16 BE) : bits 15:14 = indexN - 1 (reference pictures to decode from this entry, 1..4)
+            '                     bit  13    = 0
+            '                     bits 12:0  = packs from the RAP pack to the pack holding the last byte of the
+            '                                  indexN-th reference picture (nThRefPictureOffset = (v + 1) * 2048)
+            '   pts (u48 BE)
+            '   rpnOffset (u32 BE) : pack index of the RAP pack (2048-byte units from start of data area)
+            Dim n As Integer = _streams.Count
+            Dim epAt As Integer = &H88 + n * StreamEntrySize
             For i As Integer = 0 To n - 1
                 Dim entryOff As Integer = &H88 + i * StreamEntrySize
                 Dim s As StreamEntry = _streams(i)
-                _header(entryOff + 0) = s.StreamTypeByte
-                _header(entryOff + 4) = s.PesStreamId
-                _header(entryOff + 5) = s.SubStreamId
-                WriteU16BE(_header, entryOff + 6, s.PStdBufferRaw)
-                ' +8..+15 left at zero by default. If we ever emit per-stream EP tables, populate ep_offset and ep_num here
-                Array.Copy(s.CodecInfo, 0, _header, entryOff + 16, 32)
+                header(entryOff + 0) = s.StreamTypeByte
+                header(entryOff + 4) = s.PesStreamId
+                header(entryOff + 5) = s.SubStreamId
+                WriteU16BE(header, entryOff + 6, s.PStdBufferRaw)
+                Array.Copy(s.CodecInfo, 0, header, entryOff + 16, 32)
+                If s.EpEntries Is Nothing OrElse s.EpEntries.Count = 0 Then Continue For
+                WriteU32BE(header, entryOff + 8, CUInt(epAt))
+                WriteU32BE(header, entryOff + 12, CUInt(s.EpEntries.Count))
+                For Each e In s.EpEntries
+                    Dim idxN As Integer = Math.Max(1, Math.Min(4, e.IndexN))
+                    Dim raw As Integer = Math.Max(0, Math.Min(&H1FFF, e.RefPictureOffset))
+                    WriteU16BE(header, epAt + 0, CUShort(((idxN - 1) << 14) Or raw))
+                    WriteU48BE(header, epAt + 2, e.Pts)
+                    WriteU32BE(header, epAt + 8, CUInt(e.PackIndex And &HFFFFFFFFL))
+                    epAt += 12
+                Next
             Next
         End Sub
 
-        Private Sub BuildEpTable(n As Integer)
-            '   value0 (u16 BE) : bits 15:14 = indexN - 1
-            '                     bit  13    = unused
-            '                     bits 12:0  = nThRefPictureOffset / 0x800 (sectors, where value is offset-from-EP-base in 2048-byte units, then +1 added on read)
-            '   pts_high (u16 BE) : always 0 (greatest valid pts is UINT32_MAX)
-            '   pts_low  (u32 BE)
-            '   rpnOffset (u32 BE) : in units of 2048 bytes from start of data area
-            If _epEntries.Count = 0 Then Return
-
-            Dim epStart As Integer = &H88 + n * StreamEntrySize
-            ' Align to 8 bytes (real PAMFs do this).
-            epStart = (epStart + 7) And &H7F8
-            Dim maxEntries As Integer = (HeaderSize - epStart) \ 12
-            Dim count As Integer = Math.Min(_epEntries.Count, maxEntries)
-
-            For i As Integer = 0 To count - 1
-                Dim e As PamfMux.EpEntry = _epEntries(i)
-                Dim eo As Integer = epStart + i * 12
-                ' value0 encoding:
-                '   bits 15:14 = indexN - 1 (Sony writes 0b11 = indexN 4 for every EP)
-                '   bit  13    = unused?? (0)
-                '   bits 12:0  = sectors "to end of the 4th picture pack" (RAW value)
-                '                the reader computes nThRefPictureOffset = (raw+1)*2048
-                '                this is the exact same value ps2 payload bytes 8..9 hold for the same block
-                '
-                ' the sectors value is measured from this EP RAP pack to the pack containing the last byte of the 4th picture in its 12-frame block
-                ' captured live during mux by Mpeg2PsMuxer.PatchAvcPs2AndEp (see EpEntry.RefPictureEndSectors)
-                Dim refSectors As Integer = e.RefPictureEndSectors
-                If refSectors < 0 Then refSectors = 0
-                If refSectors > &H1FFF Then refSectors = &H1FFF
-                Dim value0 As UShort = CUShort(&HC000US Or CUShort(refSectors And &H1FFF))
-                WriteU16BE(_header, eo + 0, value0)
-                WriteU16BE(_header, eo + 2, 0US)   ' pts_high (always 0; PTS caps at UINT32_MAX)
-                WriteU32BE(_header, eo + 4, CUInt(e.Pts And &HFFFFFFFFL))
-                Dim rpnSectors As ULong = CULng((e.ByteOffset And &HFFFFFFFFL) \ 2048L)
-                WriteU32BE(_header, eo + 8, CUInt(rpnSectors And &HFFFFFFFFUL))
-            Next
-
-            ' patch first video stream entry with ep_offset and ep_num
-            For i As Integer = 0 To n - 1
-                Dim entryOff As Integer = &H88 + i * StreamEntrySize
-                Dim t As Byte = _header(entryOff + 0)
-                If t = &H1B OrElse t = &H2 Then   ' AVC or M2V
-                    WriteU32BE(_header, entryOff + 8, CUInt(epStart))
-                    WriteU32BE(_header, entryOff + 12, CUInt(count))
-                    Exit For
-                End If
-            Next
+        Private Shared Sub WriteU48BE(buf As Byte(), off As Integer, v As Long)
+            WriteU16BE(buf, off, CUShort((v >> 32) And &HFFFFL))
+            WriteU32BE(buf, off + 2, CUInt(v And &HFFFFFFFFL))
         End Sub
 
         Private Shared Sub WriteU32BE(buf As Byte(), off As Integer, v As UInteger)
