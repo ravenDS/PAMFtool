@@ -8,6 +8,7 @@ Supported streams:
 - **M2V** (**MPEG-2**) video streams 
 - **ATRAC3 Plus** audio streams
 - **LPCM** audio streams
+- **AC-3** audio streams (experimental)
 
 ## Requirements
 **[.NET 8.0](https://dotnet.microsoft.com/download/dotnet/8.0)** (or higher) - Supported platforms: **Windows, macOS, and Linux**.
@@ -19,17 +20,16 @@ Supported streams:
 * `-mux` - Mux all streams contained in a folder into a new PAMF file
 
 ### Additional `-mux` Parameters
-* `-noep` - Skip writing an entry-point seek table in the PAMF header
+* `-noep` - Skip writing entry-point (EP) seek tables in the PAMF header
 * `-deblock` - Force the codec-info deblock byte to `1` for AVC streams
 * `-nodeblock` - Force the codec-info deblock byte to `0` for AVC streams
 * `-noatsc` - Ignore any 'atsc' RIFF chunk in .at3 inputs
-* `-pace <v>` - Set SCR pacing rate. See -h for values
 * `-pstd <KB>` - Override AVC P-STD buffer size in KB
 * `-mmb <n>` - Override max_mean_bitrate byte in AVC codec_info
-* `-ps2-block <n>` - Override private_stream_2 marker cadence in AUs
+* `-ps2-block <n>` - Override minimum pictures between ps2/EP blocks (1..492)
 * `-muxrate <KBps>` - Override pack_header mux_rate (48000, 24000, or 12000)
-* `-std-delay <ticks>` - Override std_delay_bound. See -h for values
-* `-initial-scr <ticks>` - Override SCR value at pack 0 (auto-detected)
+* `-std-delay <ticks>` - Override std_delay_bound and scheduler lead limit. See -h for values
+* `-initial-scr <ticks>` - SCR origin
 
 > [!TIP]
 > Mode is also auto-detected from the input file or folder.
@@ -40,5 +40,5 @@ Supported streams:
 - Michael Jackson: The Experience (AVC + AT3+, Stereo + 5.1, LPCM)
 
 ## Notes
-- While the demuxer is fully functional, the muxer is still experimental. `PAMF` files rebuilt with this tool work in all tested PS3 games so far.
+- Starting with [v1.3](https://github.com/ravenDS/PAMFtool/releases/latest), genuine PAMF files demuxed then remuxed with PAMFtool are now byte-identical to the originals.
 - Raw H.264 data does not play in most video players. Use **ffmpeg** to mux it back into a more conventional container format.
