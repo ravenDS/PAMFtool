@@ -334,9 +334,7 @@ Namespace PamfMux
             WriteU48BE(header, &H7A, endPts90)
             ' mux_rate_bound is u32 at 0x62
             WriteU32BE(header, &H62, CUInt(muxRateUnits And &HFFFFFFFFL))
-            ' std_delay_bound is u32 at 0x66, in 1/90000 second units
-            ' 1.00 sec (90000 ticks) when peak <= 30 Mbps
-            ' 0.75 sec (67500 ticks) when peak > 30 Mbps
+            ' std_delay_bound is u32 at 0x66, in 1/90000 second units (1.00 s = 90000 unless -std-delay)
             WriteU32BE(header, &H66, CUInt(stdDelayBoundTicks And &HFFFFFFFFL))
             header(&H6D) = CByte(n)
             WriteU16BE(header, &H84, CUShort(&H32 + &H30 * (n - 1)))

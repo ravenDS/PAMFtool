@@ -1,4 +1,4 @@
-' PAMFtool 1.3 - by ravenDS
+' PAMFtool 1.4 - by ravenDS
 ' github.com/ravenDS
 
 Imports System.IO
@@ -30,7 +30,7 @@ Module Program
         '                   0 = leave at PsMuxer default (48000 kbps)
         Dim overrideMuxRateBps As Integer = 0
         ' -std-delay <ticks> : override std_delay_bound
-        '                      0 = auto (default 90000 or 67500 based on AVC HRD peak)
+        '                      0 = default 90000 (1.00 s)
         Dim overrideStdDelayTicks As Integer = 0
         ' -initial-scr <ticks> : SCR value at pack 0, Sony uses either 30 or 30030 ("game" style, 0.67 s pre-roll)
         '                        use 30030 for game-content files where Sony schedules audio bursts at packs 1/4/10
@@ -167,7 +167,8 @@ Module Program
     End Function
 
     Private Sub PrintUsage()
-        Console.WriteLine("PAMFtool v1.3 - github.com/ravenDS/PAMFtool")
+        Console.WriteLine()
+        Console.WriteLine("PAMFtool v1.4 - github.com/ravenDS/PAMFtool")
         Console.WriteLine("PlayStation Advanced Movie Format (PAMF) Muxer/Demuxer")
         Console.WriteLine()
         Console.WriteLine("Demux:  PAMFtool [-demux] <input.pamf> [outDir] [-info]")
@@ -180,21 +181,26 @@ Module Program
         Console.WriteLine("  -noatsc          Ignore any 'atsc' RIFF chunk in .at3 inputs.")
         Console.WriteLine("  -deblock         Force codec-info deblock flag to 1 (default: 1 if any slice uses the filter).")
         Console.WriteLine("  -nodeblock       Force codec-info deblock flag to 0.")
+        Console.WriteLine("  -muxrate <kbps>  Pack mux_rate: 48000 (default), 24000 or 12000.")
+        Console.WriteLine()
         Console.WriteLine("  -pstd <KB>       Force the video P-STD buffer size in KB (1..8191).")
-        Console.WriteLine("                      Default: from the AVC HRD cpb_size / MPEG-2 vbv_buffer_size")
+        Console.WriteLine("                      Default: from the AVC HRD cpb_size / MPEG-2 vbv_buffer_size.")
         Console.WriteLine("                      (level table when the SPS has no HRD).")
+        Console.WriteLine()
         Console.WriteLine("  -mmb <n>         Override max_mean_bitrate byte in AVC codec_info (0..255; default: from the AU sizes).")
         Console.WriteLine("                      Usually 11 for 1080p L4.1 CABAC, 5 for 720p L3.1 CAVLC.")
-        Console.WriteLine("  -ps2-block <N>   Minimum pictures between ps2/EP blocks (1..492). Blocks always")
-        Console.WriteLine("                      start at random access points. Default: 0.4 s (AVC), every GOP (MPEG-2).")
-        Console.WriteLine("  -muxrate <kbps>  Pack mux_rate: 48000 (default), 24000 or 12000.")
-        Console.WriteLine("  -std-delay <tk>  std_delay_bound (u32 at header 0x66) and scheduler lead limit:")
-        Console.WriteLine("                      90000 (1.00 s) when peak <= 30 Mbps")
-        Console.WriteLine("                      67500 (0.75 s) when > 30 Mbps. Auto-detected from AVC HRD")
-        Console.WriteLine("  -initial-scr <tk> SCR origin: pack 0 SCR = origin + whole packs. Default: 0 for AVC")
-        Console.WriteLine("                      High profile, 30000 otherwise (30 / 30030 accepted as 0 / 30000).")
+        Console.WriteLine()
+        Console.WriteLine("  -ps2-block <N>   Minimum pictures between ps2/EP blocks (1..492). ")
+        Console.WriteLine("                      Default: 0.4 s (AVC), every GOP (MPEG-2).")
+        Console.WriteLine()
+        Console.WriteLine("  -std-delay <tk>  std_delay_bound (u32 at header 0x66) and scheduler lead limit.")
+        Console.WriteLine("                      Default: 90000 (1.00 s). Sony's muxer also offers 67500 (0.75 s) and 45000 (0.50 s).")
+        Console.WriteLine()
+        Console.WriteLine("  -initial-scr <tk> SCR origin: pack 0 SCR = origin + whole packs. ")
+        Console.WriteLine("                      Default: 0 for AVC High profile, 30000 otherwise (30 / 30030 accepted as 0 / 30000).")
+        Console.WriteLine()
         Console.WriteLine("  -endsector       Append a 2048-byte sector with MPEG_program_end_code after the last pack")
-        Console.WriteLine("                      (counted in the header's data sectors). Default: off.")
+        Console.WriteLine("                      Default: off.")
         Console.WriteLine()
         Console.WriteLine("Additional parameters:")
         Console.WriteLine("  -info       Print info on PAMF file & streams.")

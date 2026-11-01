@@ -164,16 +164,14 @@ Friend Module PamfMuxRunner
         _videoTimings.Clear()
         _firstVideoIsHighProfile = Nothing
         If overrideMuxRateBps > 0 Then mux.PsMuxer.MuxRateBps = overrideMuxRateBps
-        If overrideStdDelayTicks > 0 Then
-            ' user-supplied override wins over any HRD-based auto-detect that happens in RegisterAndQueueAvc
-            mux.StdDelayBoundTicks = overrideStdDelayTicks
-        End If
-        Dim userSetStdDelay As Boolean = overrideStdDelayTicks > 0
+        ' std_delay_bound: 1 s (90000) unless -std-delay says otherwise
+        ' official muxer takes it from its mux settings (StdDelayType 1.00 / 0.75 / 0.50 s), not from the stream
+        If overrideStdDelayTicks > 0 Then mux.StdDelayBoundTicks = overrideStdDelayTicks
 
         ' for each input, parse codec metadata, register the stream, then slice into AUs and queue
         For Each f In files
             Select Case f.Kind
-                Case "avc" : RegisterAndQueueAvc(mux, f, forceDeblock, forceNoDeblock, overridePstdKb, overrideMmb, ps2MinPictures, userSetStdDelay)
+                Case "avc" : RegisterAndQueueAvc(mux, f, forceDeblock, forceNoDeblock, overridePstdKb, overrideMmb, ps2MinPictures)
                 Case "mpeg2" : RegisterAndQueueM2v(mux, f, overridePstdKb, ps2MinPictures)
                 Case "atrac3plus" : RegisterAndQueueAt3p(mux, f, noAtsc)
                 Case "ac3" : RegisterAndQueueAc3(mux, f)
@@ -315,8 +313,7 @@ Friend Module PamfMuxRunner
                                     forceNoDeblock As Boolean,
                                     overridePstdKb As Integer,
                                     overrideMmb As Integer,
-                                    ps2MinPictures As Integer,
-                                    userSetStdDelay As Boolean)
+                                    ps2MinPictures As Integer)
         Dim bytes As Byte() = File.ReadAllBytes(f.Path)
         Dim auStarts As List(Of Integer) = FindAvcAuStarts(bytes)
         Dim an As AvcStreamAnalysis = AvcAnalyzer.Analyze(bytes, auStarts)
@@ -363,16 +360,6 @@ Friend Module PamfMuxRunner
         If forceDeblock Then deblock = 1
         If forceNoDeblock Then deblock = 0
 
-        ' adaptive std_delay
-        ' - if SPS carried HRD parameters, we know the encoder-declared peak bit rate
-        ' - absent HRD, keep the safe default 90000 (1 s)
-        If sps.HasHrdParameters AndAlso Not userSetStdDelay AndAlso mux.StdDelayBoundTicks = 90000 Then
-            If sps.HrdPeakBitrateBps > 30_000_000L Then
-                mux.StdDelayBoundTicks = 67500
-                Console.WriteLine($"  AVC HRD peak bit rate {sps.HrdPeakBitrateBps / 1_000_000.0:F1} Mbps > 30 Mbps -> std_delay = 0.75 s (67500 ticks) per Sony spec")
-            End If
-        End If
-
         If _firstVideoIsHighProfile Is Nothing Then
             _firstVideoIsHighProfile = H264SpsParser.IsHighProfileFamily(sps.ProfileIdc)
         End If
@@ -406,12 +393,21 @@ Friend Module PamfMuxRunner
             cabacFlag:=cabac,
             deblockFlag:=deblock)
 
-        ' P-STD buffer: ceil((cpb_size / 8 + 40960) / 1024) KB from the SPS HRD (459/459 files)
-        ' without HRD, level table is kept, and the muxer raises it if AUs would otherwise arrive late
+        ' P-STD buffer: ceil((CPB / 8 + 40960) / 1024) KB
+        ' original muxer takes CPB from encoder stream info, not from SPS
+        ' CPB = max(SPS HRD cpb_size, HRD bit rate x std_delay)
+        ' cpb_size = bit rate x 1 s
+        ' without HRD, level table is kept, and muxer raises it if AUs would otherwise arrive late
         Dim cpbBits As Long = If(sps.NalHrdCpbSizeBits > 0, sps.NalHrdCpbSizeBits, sps.VclHrdCpbSizeBits)
         If cpbBits > 0 Then
-            ps.PstdBufferSize = CInt(Math.Min(CLng(Mpeg2PsMuxer.MaxPstdKb), (cpbBits \ 8L + 40960L + 1023L) \ 1024L))
-            Console.WriteLine($"  AVC HRD cpb_size {cpbBits:N0} bits -> P-STD {ps.PstdBufferSize} KB")
+            Dim delayBits As Long = CLng(Decimal.Floor(CDec(sps.HrdPeakBitrateBps) * mux.StdDelayBoundTicks / 90000D))
+            Dim bufBits As Long = Math.Max(cpbBits, delayBits)
+            ps.PstdBufferSize = CInt(Math.Min(CLng(Mpeg2PsMuxer.MaxPstdKb), (bufBits \ 8L + 40960L + 1023L) \ 1024L))
+            If delayBits > cpbBits Then
+                Console.WriteLine($"  AVC HRD cpb_size {cpbBits:N0} bits < bit rate x std_delay {delayBits:N0} bits -> P-STD {ps.PstdBufferSize} KB")
+            Else
+                Console.WriteLine($"  AVC HRD cpb_size {cpbBits:N0} bits -> P-STD {ps.PstdBufferSize} KB")
+            End If
         Else
             Console.WriteLine($"  AVC SPS has no HRD: P-STD {ps.PstdBufferSize} KB from the level {sps.LevelIdc / 10.0:F1} table")
         End If
