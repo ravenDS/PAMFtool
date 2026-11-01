@@ -16,7 +16,7 @@ Namespace PamfMux
 
         ' std_delay_bound written into PAMF header at offset 0x66 (u32, 1/90000 sec units)
         ' used as scheduler lead limit
-        ' 1.00 s (90000) when peak video bit rate <= 30 Mbps, 0.75 s (67500) above
+        ' 1.00 s (90000) unless -std-delay says otherwise
         Public Property StdDelayBoundTicks As Integer = 90000
 
         ' P-STD values that scheduler may raise when declared video buffer would make AUs arrive late

@@ -34,8 +34,7 @@ Public Class H264SpsInfo
     Public Property MatrixCoefficients As Byte    ' 1 = BT.709
 
     ' HRD (when the encoder wrote one): peak bit rate and the coded picture buffer size
-    ' std_delay_bound follows peak (1.00 s if peak <= 30 Mbps, 0.75 s above)
-    ' P-STD buffer follows CPB size: ceil((cpb_size / 8 + 40960) / 1024) KB
+    ' P-STD buffer: ceil((max(cpb_size, peak x std_delay) / 8 + 40960) / 1024) KB
     Public Property HasHrdParameters As Boolean
     Public Property HrdPeakBitrateBps As Long    ' 0 if HRD absent
     Public Property NalHrdCpbSizeBits As Long    ' 0 if NAL HRD absent (largest SchedSelIdx)
