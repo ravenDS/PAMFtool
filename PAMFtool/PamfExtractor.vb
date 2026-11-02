@@ -4,7 +4,7 @@
 '
 '  Outputs depend on whats inside the container:
 '      Video : .h264 (AVC, Annex-B) or .m2v (MPEG-2 Video ES)
-'      Audio : .at3p (ATRAC3plus raw frames) / .ac3 / .lpcm (raw PCM, BE)
+'      Audio : .at3 (ATRAC3plus in RIFF, Sony layout) / .ac3 / .lpcm (raw PCM, BE)
 
 '  PAMF layout:
 '      0x000 .. 0x007: "PAMF0041"
@@ -711,17 +711,17 @@ Public Class PamfFile
                 WriteWavHeader(w, kv.Value, lpcmCounts(kv.Key))
             Next
 
-            ' Patch ATRAC3plus RIFF headers (now that we know the frame count),
-            ' and append the atsc chunk (per-frame ATS extra_config_data) at EOF.
+            ' patch ATRAC3plus RIFF headers (now that we know the frame count)
+            ' insert atsc chunk (per-frame ATS extra_config_data) before data chunk
+            ' AT3 decoder reads frames up to the end of the file, so a chunk after data would be decoded as frames
             For Each kv In at3Streams
                 Dim w As BinaryWriter = writers(kv.Key)
                 Dim s As PamfStreamInfo = kv.Value
                 Dim stripper As Atrac3PlusAuStripper = at3Strippers(kv.Key)
-                ' 1) trailer first (extends file to its final length), so the
-                '    RIFF size we write in the header actually matches on-disk.
-                w.BaseStream.Seek(0, SeekOrigin.End)
-                WriteAt3AtscTrailer(w, stripper)
-                ' 2) patch the fixed-size prefix (RIFF / fmt / fact / data-hdr)
+                ' 1) move the frames up to make room for the atsc chunk
+                w.Flush()
+                ShiftTail(w.BaseStream, Atrac3PlusAuStripper.At3RiffHeaderLen, At3AtscChunkLength(stripper))
+                ' 2) write RIFF / fmt / fact / atsc / data-hdr in front of the frames
                 w.BaseStream.Position = 0
                 WriteAt3RiffHeader(w, s, stripper)
                 Console.WriteLine($"     at3+ s{kv.Key:D2}: {stripper.FramesWritten} frames of {stripper.StrippedFrameSize} bytes " &
@@ -1064,54 +1064,86 @@ Public Class PamfFile
     Private Sub WriteAt3RiffHeader(bw As BinaryWriter,
                                    s As PamfStreamInfo,
                                    stripper As Atrac3PlusAuStripper)
-        ' write RIFF/WAVE file using WAVE_FORMAT_EXTENSIBLE with Sony ATRAC3plus SubFormat GUID
+        ' RIFF/WAVE in Sony .at3 layout:
         '
-        ' data chunk that follows carries `frameCount` raw_data_frame blocks with ATS header stripped
-        ' nBlockAlign = stripped size
+        '   fmt  (52 bytes) WAVE_FORMAT_EXTENSIBLE, cbSize 34, samples per block 2048, channel mask, 
+        '                   ATRAC3plus SubFormat GUID BFAA23E9-58CB-7144-A119-FFFA01E4CE62 (little-endian),
+        '                   ATRAC3plus extension: u16 version 1, 16-bit codec parameters big-endian (= ATS header bytes 2-3), 8 zero bytes
         '
-        ' custom "atsc" chunk carries ATS extra_config_data (bytes 4-7 of ATS header)
-        ' stored per-frame (4 bytes per frame) so muxer can round-trip streams where extra_config_data varies frame-to-frame
+        '   fact (12 bytes) [samples][delay - 184][delay], Sony 48 kHz form
+        '                   [samples][delay - 184] for 44.1 kHz instead
+        '                   both forms read the same, and 12-byte one keeps the header size fixed (it is reserved before stream rate is known)
         '
-        ' SubFormat GUID for ATRAC3plus (little-endian):
-        '   BFAA23E9-58CB-7144-A119-FFFA01E4CE62
+        '   atsc            custom chunk: each frame ATS extra_config_data (bytes 4-7 of its ATS header, 4 bytes per frame)
+        '                   so muxer can round-trip streams where it varies frame to frame
+        '                   it comes before data, because decoder reads frames up to the end of file
+        '
+        '   data            frameCount raw_data_frame blocks with the ATS header stripped (nBlockAlign = stripped size)
+        '
+        ' PAMF stores no encoder delay
+        ' fact chunk uses Sony encoder delay without a loop (2232 samples, 2416 decoder priming samples with the 184-sample library delay)
+        ' PamfMuxRunner uses the same priming
+        ' sample count is everything the frames decode to after the priming
 
+        Const SonyEncoderDelay As Integer = 2232
+        Const LibraryDelay As Integer = 184
+
+        ' rate and channels come from the stream ATS header when there is one
+        ' PAMF header has only a 48 kHz code, so it reports 48 kHz for a 44.1 kHz stream
         Dim channels As Integer = If(s.NumChannels > 0, CInt(s.NumChannels), 2)
         Dim sampleRate As Integer = If(s.SampleRate > 0, s.SampleRate, 48000)
+        Dim params As Integer = stripper.Params
+        If params >= 0 Then
+            Select Case (params >> 13) And 7
+                Case 1 : sampleRate = 44100
+                Case 2 : sampleRate = 48000
+            End Select
+            Dim chFromIdx As Integer() = {0, 1, 2, 3, 4, 6, 7, 8}
+            If chFromIdx((params >> 10) And 7) > 0 Then channels = chFromIdx((params >> 10) And 7)
+        End If
         Dim frameSize As Integer = stripper.StrippedFrameSize
         If frameSize <= 0 Then
             ' fallback, this shouldn't happen for a stream with any AT3+ frames
             frameSize = 688
         End If
         Dim frameCount As Long = stripper.FramesWritten
-        Dim avgBps As Integer = CInt(CLng(frameSize) * sampleRate \ Atrac3PlusAuStripper.SamplesPerFrame)
+        Dim avgBps As Integer = CInt((CLng(sampleRate) * frameSize + Atrac3PlusAuStripper.SamplesPerFrame \ 2) \ Atrac3PlusAuStripper.SamplesPerFrame)
         Dim dataBytes As Long = frameCount * frameSize
-        Dim samplesTot As Long = frameCount * Atrac3PlusAuStripper.SamplesPerFrame
+        Dim samplesTot As Long = Math.Max(0L, frameCount * Atrac3PlusAuStripper.SamplesPerFrame - (SonyEncoderDelay + LibraryDelay))
+
+        ' codec parameters, those of the stream ATS headers, or rebuilt like the muxer does when no frame was seen
+        If params < 0 Then
+            Dim srIdx As Integer = If(sampleRate = 44100, 1, 2)
+            Dim chIdx As Integer
+            Select Case channels
+                Case 1 : chIdx = 1
+                Case 2 : chIdx = 2
+                Case 6 : chIdx = 5
+                Case 8 : chIdx = 7
+                Case Else : chIdx = Math.Min(channels, 7)
+            End Select
+            params = (srIdx << 13) Or (chIdx << 10) Or ((frameSize \ 8 - 1) And &H3FF)
+        End If
 
         Dim guid() As Byte = New Byte() {
             &HBF, &HAA, &H23, &HE9, &H58, &HCB, &H71, &H44,
             &HA1, &H19, &HFF, &HFA, &H1, &HE4, &HCE, &H62}
 
-        ' fmt chunk: 18 (base WAVEFORMATEX) + 22 (extension) = 40 bytes
-        Dim fmtSize As Integer = 40
+        ' fmt chunk: 18 (base WAVEFORMATEX) + 22 (extensible) + 12 (ATRAC3plus extension) = 52 bytes
+        Const fmtSize As Integer = 52
+        Const factSize As Integer = 12
 
-        ' trailing atsc chunk payload = frameCount * 4
+        ' atsc chunk payload = frameCount * 4
         ' chunk header (8 bytes) is included when it's present
         ' frameCount == 0 means no atsc chunk at all, so no 8-byte header either
-        Dim atscPayload As Long = frameCount * 4L
-        Dim atscTotal As Long = If(atscPayload > 0, atscPayload + 8L, 0L)
+        Dim atscTotal As Long = At3AtscChunkLength(stripper)
 
-        ' RIFF header (12) + fmt (8+40=48) + fact (8+8=16) + data hdr (8) + data (dataBytes) + atsc trailer = full file
-        Dim riffSize As Long = CLng(4 + 48 + 16 + 8) + dataBytes + atscTotal
+        ' "WAVE" + fmt + fact + atsc + data header + data
+        Dim riffSize As Long = CLng(4 + (8 + fmtSize) + (8 + factSize) + 8) + dataBytes + atscTotal
 
-        ' KSAUDIO channel masks
-        Dim mask As UInteger
-        Select Case channels
-            Case 1 : mask = &H4UI        ' FC
-            Case 2 : mask = &H3UI        ' FL FR
-            Case 6 : mask = &H3FUI       ' FL FR FC LFE BL BR (5.1)
-            Case 8 : mask = &H63FUI      ' FL FR FC LFE BL BR SL SR (7.1)
-            Case Else : mask = 0UI
-        End Select
+        ' channel masks that Sony tools write, by channel count (5.1 = FL FR FC LFE BL BR, 7.1 adds SL SR)
+        Dim masks As UInteger() = {0UI, &H1UI, &H3UI, &H7UI, &H107UI, 0UI, &H3FUI, &H13FUI, &H63FUI}
+        Dim mask As UInteger = If(channels >= 0 AndAlso channels < masks.Length, masks(channels), 0UI)
 
         bw.Write(Encoding.ASCII.GetBytes("RIFF"))
         bw.Write(CUInt(Math.Min(riffSize, &HFFFFFFFFL)))
@@ -1122,27 +1154,37 @@ Public Class PamfFile
         bw.Write(CUShort(&HFFFE))             ' wFormatTag = WAVE_FORMAT_EXTENSIBLE
         bw.Write(CUShort(channels))
         bw.Write(CInt(sampleRate))
-        bw.Write(CInt(avgBps))
+        bw.Write(CInt(avgBps))                ' floor(rate * blockAlign / 2048 + 0.5), as Sony's tool computes it
         bw.Write(CUShort(frameSize))          ' nBlockAlign = raw_data_frame size (ATS header stripped)
         bw.Write(CUShort(0))                  ' wBitsPerSample (compressed)
-        bw.Write(CUShort(22))                 ' cbSize (extension length)
-        bw.Write(CUShort(Atrac3PlusAuStripper.SamplesPerFrame))   ' wValidBitsPerSample = samples/block
+        bw.Write(CUShort(34))                 ' cbSize = 22 (extensible) + 12 (ATRAC3plus extension)
+        bw.Write(CUShort(Atrac3PlusAuStripper.SamplesPerFrame))   ' wSamplesPerBlock
         bw.Write(mask)
         bw.Write(guid)
+        bw.Write(CUShort(1))                  ' ATRAC3plus extension version
+        bw.Write(CByte((params >> 8) And &HFF))   ' codec parameters, big-endian (rate | channels | frame size)
+        bw.Write(CByte(params And &HFF))
+        bw.Write(New Byte(7) {})              ' reserved
 
         bw.Write(Encoding.ASCII.GetBytes("fact"))
-        bw.Write(CInt(8))
+        bw.Write(CInt(factSize))
         bw.Write(CInt(samplesTot And &HFFFFFFFFL))
-        bw.Write(CInt(0))                     ' delay samples / reserved
+        bw.Write(CInt(SonyEncoderDelay - LibraryDelay))
+        bw.Write(CInt(SonyEncoderDelay))
+
+        WriteAt3AtscChunk(bw, stripper)
 
         bw.Write(Encoding.ASCII.GetBytes("data"))
         bw.Write(CUInt(Math.Min(dataBytes, &HFFFFFFFFL)))
     End Sub
 
-    ' append the "atsc" chunk after the data chunk
-    ' payload = FramesWritten * 4 bytes
-    ' every 4-byte block is one frame's ATS extra_config_data in stream order
-    Private Sub WriteAt3AtscTrailer(bw As BinaryWriter, stripper As Atrac3PlusAuStripper)
+    ' size of atsc chunk (8-byte header + 4 bytes per frame), 0 when there are no frames
+    Private Shared Function At3AtscChunkLength(stripper As Atrac3PlusAuStripper) As Long
+        Return If(stripper.FramesWritten > 0, 8L + stripper.FramesWritten * 4L, 0L)
+    End Function
+
+    ' atsc chunk: one 4-byte block per frame, each frame ATS extra_config_data in stream order
+    Private Sub WriteAt3AtscChunk(bw As BinaryWriter, stripper As Atrac3PlusAuStripper)
         Dim n As Long = stripper.FramesWritten
         If n <= 0 Then Return
         bw.Write(Encoding.ASCII.GetBytes("atsc"))
@@ -1150,6 +1192,26 @@ Public Class PamfFile
         For Each ec In stripper.PerFrameExtraConfig
             bw.Write(ec, 0, 4)
         Next
+    End Sub
+
+    ' move the bytes from 'start' to the end of the stream 'delta' bytes further (the gap keeps its old content)
+    Private Shared Sub ShiftTail(fs As Stream, start As Long, delta As Long)
+        If delta <= 0 Then Return
+        Dim buf(1 << 20) As Byte
+        Dim pos As Long = fs.Length
+        While pos > start
+            Dim n As Integer = CInt(Math.Min(buf.Length, pos - start))
+            pos -= n
+            fs.Position = pos
+            Dim got As Integer = 0
+            While got < n
+                Dim r As Integer = fs.Read(buf, got, n - got)
+                If r <= 0 Then Throw New EndOfStreamException()
+                got += r
+            End While
+            fs.Position = pos + delta
+            fs.Write(buf, 0, n)
+        End While
     End Sub
 
     ' -- Helpers --------------------------------------------------------------
@@ -1194,11 +1256,11 @@ Friend Class Atrac3PlusAuStripper
 
     ' Header byte count produced by WriteAt3RiffHeader. ExtractAll reserves these bytes at the head of every at3+ output before demux:
     '   12 bytes RIFF / size / WAVE
-    '   48 bytes fmt  chunk header + 40-byte WAVEFORMATEXTENSIBLE payload
-    '   16 bytes fact chunk header + 8-byte payload
+    '   60 bytes fmt  chunk header + 52-byte payload (WAVEFORMATEXTENSIBLE + ATRAC3plus extension)
+    '   20 bytes fact chunk header + 12-byte payload
     '    8 bytes data chunk header
-    ' the atsc chunk is written AFTER the data chunk so it can be variable-length (FramesWritten * 4 bytes of payload)
-    Public Const At3RiffHeaderLen As Integer = 84
+    ' the variable-length atsc chunk (8 + FramesWritten * 4 bytes) is inserted before the data chunk header afterwards
+    Public Const At3RiffHeaderLen As Integer = 100
 
     Private ReadOnly _bw As BinaryWriter
     Private _frameSize As Integer = 0     ' full frame size incl. ATS header, resolved from the first ATS we see
@@ -1208,6 +1270,10 @@ Friend Class Atrac3PlusAuStripper
     Private _filled As Integer = 0
     Private ReadOnly _perFrameExtra As New List(Of Byte())()
     Public Property FramesWritten As Long
+
+    ' 16-bit codec parameters of the first ATS header (bytes 2-3: rate index, channel config, frame size),
+    ' -1 until a header was seen. They are also the low 16 bits of the ATRAC3plus configuration word.
+    Public Property Params As Integer = -1
 
     ' StrippedFrameSize is 0 until first ATS header has been parsed
     ' callers should read it after demux to fill the RIFF fmt chunk's nBlockAlign
@@ -1254,6 +1320,7 @@ Friend Class Atrac3PlusAuStripper
                         "Extraction of this stream is unsupported.")
                 End If
                 Dim data As Integer = (CInt(_sizeProbe(2)) << 8) Or _sizeProbe(3)
+                Params = data
                 Dim n As Integer = data And &H3FF
                 If n >= &H200 Then
                     Throw New InvalidDataException(

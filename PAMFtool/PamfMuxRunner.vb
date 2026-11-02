@@ -1015,7 +1015,7 @@ Friend Module PamfMuxRunner
         Dim dataLen As Integer = 0
         Dim atscOff As Integer = -1
         Dim atscSize As Integer = 0
-        ' walk ALL chunks (not just those before data), because our extractor emits atsc AFTER data chunk now
+        ' walk ALL chunks: the extractor writes atsc before the data chunk, older versions wrote it after
         While pos < data.Length - 8
             Dim chunkId As String = System.Text.Encoding.ASCII.GetString(data, pos, 4)
             Dim chunkSize As Integer = BitConverter.ToInt32(data, pos + 4)
