@@ -40,7 +40,19 @@ Namespace PamfMux
 
     Public Class AccessUnit
         Public Property StreamIndex As Integer
+        ' payload in memory, or Nothing when payload stays in input file (Source)
         Public Property Data As Byte()
+        ' payload kept in input file (large inputs): SourceLength bytes, produced by Source when packs are written
+        Public Property Source As AuPayloadSource
+        Public Property SourceOffset As Long
+        Public Property SourceLength As Integer
+        ' video AU with a Source: offset of first 00 00 01 in payload (VideoAnchorOffset of its first bytes)
+        Public Property AnchorOffset As Integer
+        Public ReadOnly Property Length As Integer
+            Get
+                Return If(Data IsNot Nothing, Data.Length, SourceLength)
+            End Get
+        End Property
         Public Property Pts As Long                     ' 90 kHz
         Public Property Dts As Long                     ' 90 kHz (audio: same as Pts)
         ' time the buffer model uses, 27 MHz: video = exact DTS, audio = PTS * 300
@@ -55,6 +67,56 @@ Namespace PamfMux
         Public Property PictureCodingType As Byte
         ' video: a private_stream_2 block starts at this AU
         Public Property StartsBlock As Boolean
+    End Class
+
+    ' produces payload of AUs whose bytes stay in input file, so an input of any size never has to fit in memory
+    ' muxer copies an AU in one or more consecutive pieces, last AU loaded stays in the buffer
+    Public MustInherit Class AuPayloadSource
+        Implements IDisposable
+
+        Private _au As AccessUnit
+        Private _buf As Byte() = Array.Empty(Of Byte)()
+
+        ' fill buf(0 .. au.SourceLength - 1) with AU payload
+        Protected MustOverride Sub Load(au As AccessUnit, buf As Byte())
+
+        Public Sub CopyTo(out As Stream, au As AccessUnit, offset As Integer, count As Integer)
+            If _au IsNot au Then
+                If _buf.Length < au.SourceLength Then
+                    _buf = New Byte(CInt(Math.Min(CLng(Array.MaxLength), (CLng(au.SourceLength) + &HFFFFL) And Not &HFFFFL)) - 1) {}
+                End If
+                _au = Nothing
+                Load(au, _buf)
+                _au = au
+            End If
+            out.Write(_buf, offset, count)
+        End Sub
+
+        Public Overridable Sub Dispose() Implements IDisposable.Dispose
+        End Sub
+    End Class
+
+    ' payload = SourceLength bytes of a file at SourceOffset
+    Public Class FilePayloadSource
+        Inherits AuPayloadSource
+
+        Private ReadOnly _path As String
+        Private _fs As FileStream
+
+        Public Sub New(path As String)
+            _path = path
+        End Sub
+
+        Protected Overrides Sub Load(au As AccessUnit, buf As Byte())
+            If _fs Is Nothing Then _fs = New FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20)
+            If _fs.Position <> au.SourceOffset Then _fs.Position = au.SourceOffset
+            _fs.ReadExactly(buf, 0, au.SourceLength)
+        End Sub
+
+        Public Overrides Sub Dispose()
+            If _fs IsNot Nothing Then _fs.Dispose()
+            _fs = Nothing
+        End Sub
     End Class
 
     Public Class PamfMuxStream
@@ -101,6 +163,29 @@ Namespace PamfMux
         Public ReadOnly Property TotalBytes As Long
             Get
                 Return If(AuStart Is Nothing, 0L, AuStart(AuStart.Length - 1))
+            End Get
+        End Property
+
+        ' LPCM PES sub-header, as Sony's muxer writes it:
+        '   byte 1 = channel_assignment << 4 | sampling frequency (1 = 48 kHz)
+        '            channel_assignment (CELL_ADEC_CH_*): 1 mono, 3 stereo, 9 = 3/2+LFE (5.1), 11 = 3/4+LFE (7.1)
+        '   u16    = bits code << 14 | first AU pointer (0x7FF = no AU starts in the PES), bits code 1 = 16-bit, 3 = 24-bit
+        Public ReadOnly Property LpcmConfigByte As Byte
+            Get
+                Dim assignment As Integer
+                Select Case NumChannels
+                    Case 1 : assignment = 1
+                    Case 6 : assignment = 9
+                    Case 8 : assignment = 11
+                    Case Else : assignment = 3
+                End Select
+                Return CByte((assignment << 4) Or 1)
+            End Get
+        End Property
+
+        Public ReadOnly Property LpcmBitsField As Integer
+            Get
+                Return If(BitsPerSample = 24, 3, 1) << 14
             End Get
         End Property
     End Class
@@ -292,11 +377,11 @@ Namespace PamfMux
                 Dim off As Long = 0
                 For k As Integer = 0 To n - 1
                     Dim au As AccessUnit = s.Aus(k)
-                    If au.Data Is Nothing OrElse au.Data.Length = 0 Then
+                    If au.Length = 0 OrElse (au.Data Is Nothing AndAlso au.Source Is Nothing) Then
                         Throw New InvalidDataException($"stream {s.Index}: empty access unit {k}")
                     End If
                     s.AuStart(k) = off
-                    off += au.Data.Length
+                    off += au.Length
                     s.T27(k) = au.DecodeTime27
                     If k > 0 AndAlso s.T27(k) < s.T27(k - 1) Then
                         Throw New InvalidDataException($"stream {s.Index}: decode times are not monotonic at AU {k}")
@@ -309,10 +394,7 @@ Namespace PamfMux
                     Dim d As Byte() = s.Aus(k).Data
                     Dim a As Integer = 0
                     If s.IsVideo Then
-                        While a + 2 < d.Length AndAlso a < 8 AndAlso Not (d(a) = 0 AndAlso d(a + 1) = 0 AndAlso d(a + 2) = 1)
-                            a += 1
-                        End While
-                        If a + 2 >= d.Length OrElse a >= 8 Then a = 0
+                        a = If(d IsNot Nothing, VideoAnchorOffset(d, 0, d.Length), s.Aus(k).AnchorOffset)
                     End If
                     s.Anchor(k) = s.AuStart(k) + a
                 Next
@@ -337,6 +419,17 @@ Namespace PamfMux
                 End If
             Next
         End Sub
+
+        ' video AU anchor: offset of the first 00 00 01 among the first 8 bytes of the AU payload d(start .. start + length - 1),
+        ' 0 when there is none
+        Public Shared Function VideoAnchorOffset(d As Byte(), start As Integer, length As Integer) As Integer
+            Dim a As Integer = 0
+            While a + 2 < length AndAlso a < 8 AndAlso Not (d(start + a) = 0 AndAlso d(start + a + 1) = 0 AndAlso d(start + a + 2) = 1)
+                a += 1
+            End While
+            If a + 2 >= length OrElse a >= 8 Then a = 0
+            Return a
+        End Function
 
         ' smallest k with AuStart(k) >= off (n when none)
         Private Shared Function FirstAuAtOrAfter(s As PamfMuxStream, off As Long) As Integer
@@ -460,13 +553,13 @@ Namespace PamfMux
                     cap = capPts
                     payload = Math.Min(CLng(capPts), remaining)
                     Dim ptr As Integer = CInt(s.AuStart(k) - pos)
-                    p.Pointer = If(s.Codec = PamfStreamType.LPCM, &H4000 Or ptr, ptr)
+                    p.Pointer = If(s.Codec = PamfStreamType.LPCM, s.LpcmBitsField Or ptr, ptr)
                 Else
                     cap = capNo
                     Dim limit As Long = remaining
                     If k < s.Aus.Count Then limit = Math.Min(limit, s.AuStart(k) - pos)
                     payload = Math.Min(CLng(capNo), limit)
-                    p.Pointer = If(s.Codec = PamfStreamType.LPCM, &H47FF, &HFFFF)
+                    p.Pointer = If(s.Codec = PamfStreamType.LPCM, s.LpcmBitsField Or &H7FF, &HFFFF)
                 End If
                 Dim leftover As Integer = cap - CInt(payload)
                 If leftover >= MinPaddingPacket Then p.Padding = leftover Else p.Stuffing = leftover
@@ -671,9 +764,9 @@ Namespace PamfMux
                 Else
                     WritePesHeader(buf, SC_PrivateStream1, AudioSubHeaderLen + p.Len, p.HasPts, pts, False, 0,
                                    p.HasPstd, s.PstdBufferSize, p.Stuffing)
-                    ' sub-header: sub_stream_id, config byte (LPCM 0x31 = 48 kHz stereo), first_au pointer
+                    ' sub-header: sub_stream_id, config byte (LPCM: channel assignment + 48 kHz, 0x31 = stereo), first_au pointer
                     WriteAudioSubHeader(buf, s.SubStreamId,
-                                        If(s.Codec = PamfStreamType.LPCM, CByte(&H31), CByte(0)),
+                                        If(s.Codec = PamfStreamType.LPCM, s.LpcmConfigByte, CByte(0)),
                                         CUShort(p.Pointer And &HFFFF))
                 End If
                 CopyPayload(buf, s, p.Pos, p.Len, auPtr(p.StreamIdx))
@@ -704,11 +797,15 @@ Namespace PamfMux
             While left > 0
                 Dim au As AccessUnit = s.Aus(k)
                 Dim inAu As Integer = CInt(cur - s.AuStart(k))
-                Dim take As Integer = Math.Min(left, au.Data.Length - inAu)
-                out.Write(au.Data, inAu, take)
+                Dim take As Integer = Math.Min(left, au.Length - inAu)
+                If au.Data IsNot Nothing Then
+                    out.Write(au.Data, inAu, take)
+                Else
+                    au.Source.CopyTo(out, au, inAu, take)
+                End If
                 left -= take
                 cur += take
-                If inAu + take >= au.Data.Length Then k += 1
+                If inAu + take >= au.Length Then k += 1
             End While
         End Sub
 
@@ -745,7 +842,7 @@ Namespace PamfMux
             Dim isM2v As Boolean = (s.Codec = PamfStreamType.MPEG2Video)
             For k As Integer = blk.FirstAu To blk.FirstAu + n - 1
                 Dim au As AccessUnit = s.Aus(k)
-                Dim size As Integer = au.Data.Length
+                Dim size As Integer = au.Length
                 If isM2v Then
                     If size > &HFFFFFF Then size = &HFFFFFF
                     out.WriteByte(CByte((au.PictureCodingType And 7) << 5))

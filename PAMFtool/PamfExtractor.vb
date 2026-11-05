@@ -568,9 +568,9 @@ Public Class PamfFile
                     s.SampleRate = If(fsCode = 1, 48000, 0)
 
                 Case PamfStreamType.LPCM
-                    ' LPCM bit-depth is a coded byte at ci(4)
+                    ' LPCM bit-depth: coded byte at ci(4), bits code << 6
                     '   0x01 / 0x40 => 16-bit
-                    '   0x03 / 0x50 => 24-bit  (0x50 inferred, unverified)
+                    '   0x03 / 0xC0 => 24-bit  (0x50 = what PAMFtool 1.4 and older wrote for 24-bit)
                     ' anything else -> 0 = unknown (WriteWavHeader falls back to 16)
                     s.NumChannels = raw(ci + 2)
                     Dim fsCode As Integer = raw(ci + 3)
@@ -578,7 +578,7 @@ Public Class PamfFile
                     Dim bpsCode As Integer = raw(ci + 4)
                     Select Case bpsCode
                         Case &H1, &H40 : s.BitsPerSample = 16
-                        Case &H3, &H50 : s.BitsPerSample = 24
+                        Case &H3, &HC0, &H50 : s.BitsPerSample = 24
                         Case Else : s.BitsPerSample = 0
                     End Select
             End Select
@@ -673,8 +673,8 @@ Public Class PamfFile
                 Console.WriteLine($"  -> {outName}   ({s})")
 
                 If s.StreamType = PamfStreamType.LPCM AndAlso wrapLpcmAsWav Then
-                    ' Reserve 44 bytes for WAV header, filled in after
-                    bw.Write(New Byte(43) {})
+                    ' reserve WAV header (44 bytes, 80 for PAMF > 4 GB), filled in after
+                    bw.Write(New Byte(LpcmWavHeaderLength() - 1) {})
                     lpcmStreams(s.Index) = s
                     lpcmCounts(s.Index) = 0
                     Dim bps As Integer = If(s.BitsPerSample > 0, CInt(s.BitsPerSample), 16)
@@ -708,7 +708,7 @@ Public Class PamfFile
             For Each kv In lpcmStreams
                 Dim w As BinaryWriter = writers(kv.Key)
                 w.BaseStream.Position = 0
-                WriteWavHeader(w, kv.Value, lpcmCounts(kv.Key))
+                WriteWavHeader(w, kv.Value, lpcmCounts(kv.Key), LpcmWavHeaderLength())
             Next
 
             ' patch ATRAC3plus RIFF headers (now that we know the frame count)
@@ -1013,6 +1013,7 @@ Public Class PamfFile
                         ' PAMF LPCM samples are big-endian, may straddle PES boundaries.
                         ' for mono streams, the swapper drops the dummy silence channel
                         Dim sw As LpcmBeToLeSwapper = lpcmSwappers(s.Index)
+                        If Not sw.Configured Then sw.ConfigureChannelOrder(buf(payOff + 1))
                         Dim before As Long = sw.BytesWritten
                         sw.Append(buf, esOff, esLen)
                         lpcmCounts(s.Index) += sw.BytesWritten - before
@@ -1037,7 +1038,16 @@ Public Class PamfFile
         Return True
     End Function
 
-    Private Sub WriteWavHeader(bw As BinaryWriter, s As PamfStreamInfo, dataBytes As Long)
+    ' WAV header for LPCM samples:
+    '   44 bytes: RIFF / fmt (PCM, 16 bytes) / data, sizes unsigned 32-bit
+    '   80 bytes, for PAMF > 4 GB (LPCM may pass 4 GB RIFF limit):
+    '             a 28-byte chunk follows WAVE, JUNK while data fits RIFF sizes,
+    '             otherwise file is RF64 and that chunk is ds64 (64-bit sizes)
+    Private Function LpcmWavHeaderLength() As Integer
+        Return If(FileSize >= &HFFFFFFFFL - 1024L, 80, 44)
+    End Function
+
+    Private Sub WriteWavHeader(bw As BinaryWriter, s As PamfStreamInfo, dataBytes As Long, headerLen As Integer)
         ' PAMF LPCM is big-endian samples, the data has already been byte-swapped by LpcmBeToLeSwapper before this
         ' WAV is directly playable
         Dim sampleRate As Integer = If(s.SampleRate > 0, s.SampleRate, 48000)
@@ -1045,10 +1055,24 @@ Public Class PamfFile
         Dim bps As Integer = If(s.BitsPerSample > 0, CInt(s.BitsPerSample), 16)
         Dim byteRate As Integer = sampleRate * channels * (bps \ 8)
         Dim blockAlign As Integer = channels * (bps \ 8)
+        Dim riffSize As Long = headerLen - 8 + dataBytes
+        Dim rf64 As Boolean = (headerLen = 80 AndAlso riffSize > &HFFFFFFFFL)
 
-        bw.Write(Encoding.ASCII.GetBytes("RIFF"))
-        bw.Write(CInt(36 + dataBytes))
+        bw.Write(Encoding.ASCII.GetBytes(If(rf64, "RF64", "RIFF")))
+        bw.Write(If(rf64, &HFFFFFFFFUI, CUInt(Math.Min(riffSize, &HFFFFFFFFL))))
         bw.Write(Encoding.ASCII.GetBytes("WAVE"))
+        If headerLen = 80 Then
+            bw.Write(Encoding.ASCII.GetBytes(If(rf64, "ds64", "JUNK")))
+            bw.Write(28)
+            If rf64 Then
+                bw.Write(riffSize)                    ' u64 RIFF size
+                bw.Write(dataBytes)                   ' u64 data size
+                bw.Write(dataBytes \ blockAlign)      ' u64 sample count
+                bw.Write(0)                           ' table length
+            Else
+                bw.Write(New Byte(27) {})
+            End If
+        End If
         bw.Write(Encoding.ASCII.GetBytes("fmt "))
         bw.Write(16)                              ' fmt chunk size
         bw.Write(CShort(1))                       ' PCM
@@ -1058,7 +1082,7 @@ Public Class PamfFile
         bw.Write(CShort(blockAlign))
         bw.Write(CShort(bps))
         bw.Write(Encoding.ASCII.GetBytes("data"))
-        bw.Write(CInt(dataBytes))
+        bw.Write(If(rf64, &HFFFFFFFFUI, CUInt(Math.Min(dataBytes, &HFFFFFFFFL))))
     End Sub
 
     Private Sub WriteAt3RiffHeader(bw As BinaryWriter,
@@ -1362,15 +1386,17 @@ End Class
 ' standard WAV expects little-endian, samples can be 16-bit or 24-bit and a single sample may straddle a PES boundary
 '
 ' mono streams are stored as two channels (mono + silent dummy channel)
+' 5.1 / 7.1 stored in PS3 order (L R C Ls Rs LFE / L R C Ls Lrs Rrs Rs LFE)
 Friend Class LpcmBeToLeSwapper
 
     Private ReadOnly _bw As BinaryWriter
     Private ReadOnly _bytesPerSample As Integer   ' bytes for one channel sample (2 = 16-bit, 3 = 24-bit)
     Private ReadOnly _channelsOnWire As Integer   ' channels present in the PAMF (padded to even for mono)
     Private ReadOnly _channelsToWrite As Integer  ' channels the WAV output should carry (unpadded)
-    Private ReadOnly _sample As Byte()
+    Private ReadOnly _frame As Byte()             ' one sample-time of all wire channels, filled across PES boundaries
     Private _filled As Integer = 0
-    Private _channelIdx As Integer = 0            ' which channel of the current sample-time is currently being filled
+    Private _map As Integer()                     ' wire channel of each WAV channel
+    Private _out As Byte() = Array.Empty(Of Byte)()
     Private _bytesWritten As Long = 0
 
     ' total bytes emitted to WAV so far, differs from input length when channelsOnWire > channelsToWrite (mono padding)
@@ -1379,6 +1405,9 @@ Friend Class LpcmBeToLeSwapper
             Return _bytesWritten
         End Get
     End Property
+
+    ' channel order chosen (from first PES sub-header)
+    Public Property Configured As Boolean
 
     ' overload for existing call sites, assumes no padding
     Public Sub New(bw As BinaryWriter, bytesPerSample As Integer)
@@ -1399,33 +1428,72 @@ Friend Class LpcmBeToLeSwapper
         _bytesPerSample = bytesPerSample
         _channelsOnWire = channelsOnWire
         _channelsToWrite = channelsToWrite
-        _sample = New Byte(bytesPerSample - 1) {}
+        _frame = New Byte(channelsOnWire * bytesPerSample - 1) {}
+        _map = New Integer(channelsToWrite - 1) {}
+        For k As Integer = 0 To channelsToWrite - 1
+            _map(k) = k
+        Next
+    End Sub
+
+    ' LPCM sub-header byte 1 (channel_assignment << 4 | fs): PS3 channel order for 3/2+LFE and 3/4+LFE
+    Public Sub ConfigureChannelOrder(subHeaderConfig As Byte)
+        Configured = True
+        Dim assignment As Integer = subHeaderConfig >> 4
+        If assignment = 9 AndAlso _channelsToWrite = 6 AndAlso _channelsOnWire = 6 Then
+            _map = {0, 1, 2, 5, 3, 4}
+        ElseIf assignment = 11 AndAlso _channelsToWrite = 8 AndAlso _channelsOnWire = 8 Then
+            _map = {0, 1, 2, 7, 4, 5, 3, 6}
+        End If
     End Sub
 
     Public Sub Append(source As Byte(), offset As Integer, count As Integer)
+        Dim frameBytes As Integer = _frame.Length
+        Dim outFrame As Integer = _channelsToWrite * _bytesPerSample
+        If _out.Length < (count \ frameBytes + 1) * outFrame Then _out = New Byte((count \ frameBytes + 1) * outFrame - 1) {}
+        Dim o As Integer = 0
         Dim p As Integer = offset
         Dim remain As Integer = count
-        While remain > 0
-            Dim need As Integer = _bytesPerSample - _filled
-            Dim take As Integer = If(need <= remain, need, remain)
-            Buffer.BlockCopy(source, p, _sample, _filled, take)
+        ' sample-time started in an earlier PES
+        If _filled > 0 Then
+            Dim take As Integer = Math.Min(frameBytes - _filled, remain)
+            Buffer.BlockCopy(source, p, _frame, _filled, take)
             _filled += take
             p += take
             remain -= take
-            If _filled = _bytesPerSample Then
-                ' one channel sample assembled.
-                ' emit if its a "real" channel, skip it if its a dummy channel
-                If _channelIdx < _channelsToWrite Then
-                    For i As Integer = _bytesPerSample - 1 To 0 Step -1
-                        _bw.Write(_sample(i))
-                    Next
-                    _bytesWritten += _bytesPerSample
-                End If
+            If _filled = frameBytes Then
+                EmitFrame(_frame, 0, o)
+                o += outFrame
                 _filled = 0
-                _channelIdx += 1
-                If _channelIdx = _channelsOnWire Then _channelIdx = 0
             End If
+        End If
+        ' whole sample-times straight from PES payload
+        While remain >= frameBytes
+            EmitFrame(source, p, o)
+            o += outFrame
+            p += frameBytes
+            remain -= frameBytes
         End While
+        ' keep start of a sample-time that continues in next PES
+        If remain > 0 Then
+            Buffer.BlockCopy(source, p, _frame, _filled, remain)
+            _filled += remain
+        End If
+        If o > 0 Then
+            _bw.Write(_out, 0, o)
+            _bytesWritten += o
+        End If
+    End Sub
+
+    ' WAV channels of one sample-time LE, dummy channel dropped
+    Private Sub EmitFrame(src As Byte(), at As Integer, o As Integer)
+        Dim bps As Integer = _bytesPerSample
+        For k As Integer = 0 To _channelsToWrite - 1
+            Dim s As Integer = at + _map(k) * bps
+            For i As Integer = 0 To bps - 1
+                _out(o + i) = src(s + bps - 1 - i)
+            Next
+            o += bps
+        Next
     End Sub
 
 End Class

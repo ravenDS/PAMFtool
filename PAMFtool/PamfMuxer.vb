@@ -115,6 +115,9 @@ Namespace PamfMux
             Dim ps As PamfMuxStream = PsMuxer.AddStream(PamfStreamType.LPCM)
             ps.NumChannels = numChannels
             ps.BitsPerSample = CByte(bitsPerSample And &HFF)
+            ' P-STD buffer by channel count
+            ' 2 channels 128 KB, 3..6 channels 384 KB, more 512 KB
+            ps.PstdBufferSize = If(numChannels <= 2, 128, If(numChannels <= 6, 384, 512))
             ' LPCM uses sub_stream_id 0x40 | ch
             HeaderWriter.AddLpcmStream(
                 channel:=numChannels, subStreamId:=ps.SubStreamId,
@@ -134,7 +137,7 @@ Namespace PamfMux
             For Each s In PsMuxer.Streams
                 Dim maxAu As Long = 0
                 For Each au In s.Aus
-                    If au.Data.LongLength > maxAu Then maxAu = au.Data.LongLength
+                    If au.Length > maxAu Then maxAu = au.Length
                 Next
                 Dim minKb As Integer = CInt((maxAu + 2L * Mpeg2PsPrimitives.SectorSize + 1023L) \ 1024L)
                 If s.PstdBufferSize < minKb Then
