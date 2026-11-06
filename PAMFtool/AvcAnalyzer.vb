@@ -48,7 +48,7 @@ End Class
 
 Friend Module AvcAnalyzer
 
-    Private Class SliceHeader
+    Friend Class SliceHeader
         Public SliceType As Integer           ' 0 P, 1 B, 2 I, 3 SP, 4 SI
         Public PpsId As Integer
         Public FrameNum As Integer
@@ -63,89 +63,103 @@ Friend Module AvcAnalyzer
     End Class
 
     Public Function Analyze(bytes As Byte(), auStarts As List(Of Integer)) As AvcStreamAnalysis
-        Dim r As New AvcStreamAnalysis()
-        Dim spsById As New Dictionary(Of Integer, H264SpsInfo)()
-        Dim ppsById As New Dictionary(Of Integer, H264PpsInfo)()
-        Dim firstSliceOf As New List(Of SliceHeader)()
-        Dim nalRefOf As New List(Of Integer)()
-        Dim idrOf As New List(Of Boolean)()
-        Dim spsOfPic As New List(Of H264SpsInfo)()
-
+        Dim st As New AvcAnalyzerState()
         For k As Integer = 0 To auStarts.Count - 1
             Dim a As Integer = auStarts(k)
             Dim b As Integer = If(k + 1 < auStarts.Count, auStarts(k + 1), bytes.Length)
-            Dim pic As New AvcPictureInfo() With {.AllIntra = True}
-            Dim first As SliceHeader = Nothing
-            Dim firstRef As Integer = 0
-            Dim firstSps As H264SpsInfo = Nothing
-            Dim nal As NalSpan
-            Dim p As Integer = a
-            While NextNal(bytes, p, b, nal)
-                p = nal.PayloadEnd
-                Dim hb As Integer = bytes(nal.Header)
-                Dim nt As Integer = hb And &H1F
-                Dim nri As Integer = (hb >> 5) And 3
-                Select Case nt
-                    Case 7
-                        pic.HasSps = True
-                        Dim sps As H264SpsInfo = H264SpsParser.ParseSpsNal(bytes, nal.Header, nal.PayloadEnd)
-                        If sps Is Nothing Then
-                            r.SpsParseFailures += 1
-                        Else
-                            spsById(sps.SpsId) = sps
-                            If r.FirstSps Is Nothing Then r.FirstSps = sps
-                        End If
-                    Case 8
-                        Dim pps As H264PpsInfo = H264PpsParser.ParsePpsNal(bytes, nal.Header, nal.PayloadEnd)
-                        If pps Is Nothing Then
-                            r.PpsParseFailures += 1
-                        Else
-                            ppsById(pps.PpsId) = pps
-                            If r.FirstPps Is Nothing Then r.FirstPps = pps
-                        End If
-                    Case 6
-                        If SeiHasRecoveryPoint0(bytes, nal.Header, nal.PayloadEnd) Then pic.HasRecoveryPoint0 = True
-                    Case 1, 5
-                        pic.HasVcl = True
-                        If nt = 5 Then pic.IsIdr = True
-                        If nri <> 0 Then pic.IsReference = True
-                        r.SliceCount += 1
-                        Dim sh As SliceHeader = Nothing
-                        Dim spsUsed As H264SpsInfo = Nothing
-                        Try
-                            sh = ParseSliceHeader(bytes, nal.Header, nal.PayloadEnd, nt, nri, spsById, ppsById, spsUsed)
-                        Catch
-                            sh = Nothing
-                        End Try
-                        If sh Is Nothing Then
-                            r.SliceParseFailures += 1
-                            pic.AllIntra = False         ' unknown slice type: never call it intra
-                        Else
-                            If sh.DisableDeblockIdc = 1 Then
-                                r.SlicesDeblockOff += 1
-                            Else
-                                r.SlicesDeblockOn += 1
-                            End If
-                            If sh.SliceType <> 2 AndAlso sh.SliceType <> 4 Then pic.AllIntra = False
-                            If first Is Nothing Then
-                                first = sh
-                                firstRef = nri
-                                firstSps = spsUsed
-                            End If
-                        End If
-                End Select
-            End While
-            If Not pic.HasVcl Then pic.AllIntra = False
-            r.Pictures.Add(pic)
-            firstSliceOf.Add(first)
-            nalRefOf.Add(firstRef)
-            idrOf.Add(pic.IsIdr)
-            spsOfPic.Add(firstSps)
+            AddAccessUnit(st, bytes, a, b)
         Next
+        Return Finish(st)
+    End Function
 
-        ComputePoc(r, firstSliceOf, nalRefOf, spsOfPic)
-        ComputeOrder(r)
-        Return r
+    ' analysis fed one AU at a time (muxer streams input file, an AU is all it has in memory)
+    Friend Class AvcAnalyzerState
+        Friend ReadOnly R As New AvcStreamAnalysis()
+        Friend ReadOnly SpsById As New Dictionary(Of Integer, H264SpsInfo)()
+        Friend ReadOnly PpsById As New Dictionary(Of Integer, H264PpsInfo)()
+        Friend ReadOnly FirstSliceOf As New List(Of SliceHeader)()
+        Friend ReadOnly NalRefOf As New List(Of Integer)()
+        Friend ReadOnly SpsOfPic As New List(Of H264SpsInfo)()
+    End Class
+
+    ' one AU, bytes(a .. b - 1), AUs in decode order
+    Public Sub AddAccessUnit(st As AvcAnalyzerState, bytes As Byte(), a As Integer, b As Integer)
+        Dim r As AvcStreamAnalysis = st.R
+        Dim spsById As Dictionary(Of Integer, H264SpsInfo) = st.SpsById
+        Dim ppsById As Dictionary(Of Integer, H264PpsInfo) = st.PpsById
+        Dim pic As New AvcPictureInfo() With {.AllIntra = True}
+        Dim first As SliceHeader = Nothing
+        Dim firstRef As Integer = 0
+        Dim firstSps As H264SpsInfo = Nothing
+        Dim nal As NalSpan
+        Dim p As Integer = a
+        While NextNal(bytes, p, b, nal)
+            p = nal.PayloadEnd
+            Dim hb As Integer = bytes(nal.Header)
+            Dim nt As Integer = hb And &H1F
+            Dim nri As Integer = (hb >> 5) And 3
+            Select Case nt
+                Case 7
+                    pic.HasSps = True
+                    Dim sps As H264SpsInfo = H264SpsParser.ParseSpsNal(bytes, nal.Header, nal.PayloadEnd)
+                    If sps Is Nothing Then
+                        r.SpsParseFailures += 1
+                    Else
+                        spsById(sps.SpsId) = sps
+                        If r.FirstSps Is Nothing Then r.FirstSps = sps
+                    End If
+                Case 8
+                    Dim pps As H264PpsInfo = H264PpsParser.ParsePpsNal(bytes, nal.Header, nal.PayloadEnd)
+                    If pps Is Nothing Then
+                        r.PpsParseFailures += 1
+                    Else
+                        ppsById(pps.PpsId) = pps
+                        If r.FirstPps Is Nothing Then r.FirstPps = pps
+                    End If
+                Case 6
+                    If SeiHasRecoveryPoint0(bytes, nal.Header, nal.PayloadEnd) Then pic.HasRecoveryPoint0 = True
+                Case 1, 5
+                    pic.HasVcl = True
+                    If nt = 5 Then pic.IsIdr = True
+                    If nri <> 0 Then pic.IsReference = True
+                    r.SliceCount += 1
+                    Dim sh As SliceHeader = Nothing
+                    Dim spsUsed As H264SpsInfo = Nothing
+                    Try
+                        sh = ParseSliceHeader(bytes, nal.Header, nal.PayloadEnd, nt, nri, spsById, ppsById, spsUsed)
+                    Catch
+                        sh = Nothing
+                    End Try
+                    If sh Is Nothing Then
+                        r.SliceParseFailures += 1
+                        pic.AllIntra = False         ' unknown slice type: never call it intra
+                    Else
+                        If sh.DisableDeblockIdc = 1 Then
+                            r.SlicesDeblockOff += 1
+                        Else
+                            r.SlicesDeblockOn += 1
+                        End If
+                        If sh.SliceType <> 2 AndAlso sh.SliceType <> 4 Then pic.AllIntra = False
+                        If first Is Nothing Then
+                            first = sh
+                            firstRef = nri
+                            firstSps = spsUsed
+                        End If
+                    End If
+            End Select
+        End While
+        If Not pic.HasVcl Then pic.AllIntra = False
+        r.Pictures.Add(pic)
+        st.FirstSliceOf.Add(first)
+        st.NalRefOf.Add(firstRef)
+        st.SpsOfPic.Add(firstSps)
+    End Sub
+
+    ' POC and display order once all AUs are in
+    Public Function Finish(st As AvcAnalyzerState) As AvcStreamAnalysis
+        ComputePoc(st.R, st.FirstSliceOf, st.NalRefOf, st.SpsOfPic)
+        ComputeOrder(st.R)
+        Return st.R
     End Function
 
     ' sei_rbsp(): walk sei_message()s, report a recovery point (payloadType 6) with recovery_frame_cnt = 0

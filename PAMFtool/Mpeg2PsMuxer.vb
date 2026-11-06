@@ -40,7 +40,19 @@ Namespace PamfMux
 
     Public Class AccessUnit
         Public Property StreamIndex As Integer
+        ' payload in memory, or Nothing when payload stays in input file (Source)
         Public Property Data As Byte()
+        ' payload kept in input file (large inputs): SourceLength bytes, produced by Source when packs are written
+        Public Property Source As AuPayloadSource
+        Public Property SourceOffset As Long
+        Public Property SourceLength As Integer
+        ' video AU with a Source: offset of first 00 00 01 in payload (VideoAnchorOffset of its first bytes)
+        Public Property AnchorOffset As Integer
+        Public ReadOnly Property Length As Integer
+            Get
+                Return If(Data IsNot Nothing, Data.Length, SourceLength)
+            End Get
+        End Property
         Public Property Pts As Long                     ' 90 kHz
         Public Property Dts As Long                     ' 90 kHz (audio: same as Pts)
         ' time the buffer model uses, 27 MHz: video = exact DTS, audio = PTS * 300
@@ -53,8 +65,65 @@ Namespace PamfMux
         Public Property IsReferenceFrame As Boolean = True
         ' MPEG-2 video: picture_coding_type (1 I, 2 P, 3 B), 0 for AVC
         Public Property PictureCodingType As Byte
+        ' video: 1 top field, 2 bottom field, 0 / 3 frame
+        Public Property PictureStructure As Byte
+        Public ReadOnly Property IsField As Boolean
+            Get
+                Return PictureStructure = 1 OrElse PictureStructure = 2
+            End Get
+        End Property
         ' video: a private_stream_2 block starts at this AU
         Public Property StartsBlock As Boolean
+    End Class
+
+    ' produces payload of AUs whose bytes stay in input file, so an input of any size never has to fit in memory
+    ' muxer copies an AU in one or more consecutive pieces, last AU loaded stays in the buffer
+    Public MustInherit Class AuPayloadSource
+        Implements IDisposable
+
+        Private _au As AccessUnit
+        Private _buf As Byte() = Array.Empty(Of Byte)()
+
+        ' fill buf(0 .. au.SourceLength - 1) with AU payload
+        Protected MustOverride Sub Load(au As AccessUnit, buf As Byte())
+
+        Public Sub CopyTo(out As Stream, au As AccessUnit, offset As Integer, count As Integer)
+            If _au IsNot au Then
+                If _buf.Length < au.SourceLength Then
+                    _buf = New Byte(CInt(Math.Min(CLng(Array.MaxLength), (CLng(au.SourceLength) + &HFFFFL) And Not &HFFFFL)) - 1) {}
+                End If
+                _au = Nothing
+                Load(au, _buf)
+                _au = au
+            End If
+            out.Write(_buf, offset, count)
+        End Sub
+
+        Public Overridable Sub Dispose() Implements IDisposable.Dispose
+        End Sub
+    End Class
+
+    ' payload = SourceLength bytes of a file at SourceOffset
+    Public Class FilePayloadSource
+        Inherits AuPayloadSource
+
+        Private ReadOnly _path As String
+        Private _fs As FileStream
+
+        Public Sub New(path As String)
+            _path = path
+        End Sub
+
+        Protected Overrides Sub Load(au As AccessUnit, buf As Byte())
+            If _fs Is Nothing Then _fs = New FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20)
+            If _fs.Position <> au.SourceOffset Then _fs.Position = au.SourceOffset
+            _fs.ReadExactly(buf, 0, au.SourceLength)
+        End Sub
+
+        Public Overrides Sub Dispose()
+            If _fs IsNot Nothing Then _fs.Dispose()
+            _fs = Nothing
+        End Sub
     End Class
 
     Public Class PamfMuxStream
@@ -103,6 +172,29 @@ Namespace PamfMux
                 Return If(AuStart Is Nothing, 0L, AuStart(AuStart.Length - 1))
             End Get
         End Property
+
+        ' LPCM PES sub-header, as Sony's muxer writes it:
+        '   byte 1 = channel_assignment << 4 | sampling frequency (1 = 48 kHz)
+        '            channel_assignment (CELL_ADEC_CH_*): 1 mono, 3 stereo, 9 = 3/2+LFE (5.1), 11 = 3/4+LFE (7.1)
+        '   u16    = bits code << 14 | first AU pointer (0x7FF = no AU starts in the PES), bits code 1 = 16-bit, 3 = 24-bit
+        Public ReadOnly Property LpcmConfigByte As Byte
+            Get
+                Dim assignment As Integer
+                Select Case NumChannels
+                    Case 1 : assignment = 1
+                    Case 6 : assignment = 9
+                    Case 8 : assignment = 11
+                    Case Else : assignment = 3
+                End Select
+                Return CByte((assignment << 4) Or 1)
+            End Get
+        End Property
+
+        Public ReadOnly Property LpcmBitsField As Integer
+            Get
+                Return If(BitsPerSample = 24, 3, 1) << 14
+            End Get
+        End Property
     End Class
 
     ' one EP map entry (one per ps2 block that starts at a random access point)
@@ -145,7 +237,10 @@ Namespace PamfMux
     Public Class Mpeg2PsMuxer
 
         Public Const PtsClockHz As Long = 90000L
-        Public Const MaxPs2Pictures As Integer = 492          ' ps2 of 18 + 4N bytes must fit the RAP pack
+        ' pamfmux keeps the picture count of a block in a byte (CAuInformation), so at most 255 pictures per block
+        Public Const MaxPs2Pictures As Integer = 255
+        ' AVC AU size field of a ps2 entry is 21 bits (pamfmux refuses larger AUs, PAMFtool writes the maximum)
+        Public Const MaxAvcPs2AuSize As Integer = &H1FFFFF
         ' mid-block video timestamps, measured against PTS of the previous video stamp:
         '   first AU starting in a PES is stamped when its DTS is >= StampIntervalTicks (0.5 s) after it
         '   (43544 < x <= 45045)
@@ -155,6 +250,13 @@ Namespace PamfMux
         '   so that j opens next PES and can carry the stamp
         Public Const StampIntervalTicks As Long = 45000L
         Public Const CutIntervalTicks As Long = 54000L
+        ' -pamfmuxk: rules of pamfmux (MpsMux CVideoPesPacketizer), AVC and MPEG-2 alike, against PTS of the previous video stamp (L):
+        '   first AU whose first byte is in the PES is stamped when SonyStampMinTicks < PTS - L <= SonyStampMaxTicks
+        '   and at least 2 of its bytes fit after the longer header
+        '   PES ends before a later AU j when j is in that window and PTS(j + 1) - L > SonyCutTicks
+        Public Const SonyStampMinTicks As Long = 46000L
+        Public Const SonyStampMaxTicks As Long = 63000L
+        Public Const SonyCutTicks As Long = 55000L
         Public Const MaxPstdKb As Integer = 8191              ' 13-bit P-STD_buffer_size
         ' fill up to 7 spare bytes with PES header stuffing and use a padding packet from 8 bytes on
         Public Const MinPaddingPacket As Integer = 8
@@ -185,8 +287,11 @@ Namespace PamfMux
         '   30000  : everything else, AVC Main and MPEG-2 (SCR0 = 30030.72 at 48 Mbps)
         Public Property ScrOriginTicks As Long = 30000L
 
-        ' True: append a sector with MPEG_program_end_code (+ padding) after the last pack
+        ' true: append sector with MPEG_program_end_code after last pack (00 00 01 B9 and zeros)
         Public Property WriteEndSector As Boolean = False
+
+        ' true: mid-block video timestamps follow pamfmux (see SonyStampMinTicks)
+        Public Property SonyClock As Boolean = False
 
         Public ReadOnly Property Streams As New List(Of PamfMuxStream)()
 
@@ -280,6 +385,7 @@ Namespace PamfMux
         Private _needExt As Boolean()
         Private _cand As Candidate()
         Private _endAuPtr As Integer()
+        Private _masterVideo As Integer = -1
 
         ' build per-stream arrays and video blocks, throws on inputs that planner cannot handle
         Private Sub Prepare()
@@ -292,11 +398,11 @@ Namespace PamfMux
                 Dim off As Long = 0
                 For k As Integer = 0 To n - 1
                     Dim au As AccessUnit = s.Aus(k)
-                    If au.Data Is Nothing OrElse au.Data.Length = 0 Then
+                    If au.Length = 0 OrElse (au.Data Is Nothing AndAlso au.Source Is Nothing) Then
                         Throw New InvalidDataException($"stream {s.Index}: empty access unit {k}")
                     End If
                     s.AuStart(k) = off
-                    off += au.Data.Length
+                    off += au.Length
                     s.T27(k) = au.DecodeTime27
                     If k > 0 AndAlso s.T27(k) < s.T27(k - 1) Then
                         Throw New InvalidDataException($"stream {s.Index}: decode times are not monotonic at AU {k}")
@@ -309,10 +415,7 @@ Namespace PamfMux
                     Dim d As Byte() = s.Aus(k).Data
                     Dim a As Integer = 0
                     If s.IsVideo Then
-                        While a + 2 < d.Length AndAlso a < 8 AndAlso Not (d(a) = 0 AndAlso d(a + 1) = 0 AndAlso d(a + 2) = 1)
-                            a += 1
-                        End While
-                        If a + 2 >= d.Length OrElse a >= 8 Then a = 0
+                        a = If(d IsNot Nothing, VideoAnchorOffset(d, 0, d.Length), s.Aus(k).AnchorOffset)
                     End If
                     s.Anchor(k) = s.AuStart(k) + a
                 Next
@@ -321,6 +424,9 @@ Namespace PamfMux
                 If s.IsVideo Then
                     s.Aus(0).StartsBlock = True
                     Dim blk As VideoBlock = Nothing
+                    ' reference pictures of a block: a frame counts, reference fields count once per pair (at second field)
+                    ' a block starts as if a field pair had just ended, so a lone last field is not counted
+                    Dim pairDone As Boolean = True
                     For k As Integer = 0 To n - 1
                         If s.Aus(k).StartsBlock OrElse blk Is Nothing OrElse blk.AuCount >= MaxPs2Pictures Then
                             If blk IsNot Nothing Then blk.EndOffset = s.AuStart(k)
@@ -329,14 +435,33 @@ Namespace PamfMux
                                 .IsRap = s.Aus(k).IsRandomAccessPoint
                             }
                             s.Blocks.Add(blk)
+                            pairDone = True
                         End If
                         blk.AuCount += 1
-                        If s.Aus(k).IsReferenceFrame AndAlso blk.Refs.Count < 4 Then blk.Refs.Add(k)
+                        If s.Aus(k).IsReferenceFrame Then
+                            Dim counts As Boolean = True
+                            If s.Aus(k).IsField Then
+                                counts = Not pairDone
+                                pairDone = Not pairDone
+                            End If
+                            If counts AndAlso blk.Refs.Count < 4 Then blk.Refs.Add(k)
+                        End If
                     Next
                     blk.EndOffset = s.AuStart(n)
                 End If
             Next
         End Sub
+
+        ' video AU anchor: offset of the first 00 00 01 among the first 8 bytes of the AU payload d(start .. start + length - 1),
+        ' 0 when there is none
+        Public Shared Function VideoAnchorOffset(d As Byte(), start As Integer, length As Integer) As Integer
+            Dim a As Integer = 0
+            While a + 2 < length AndAlso a < 8 AndAlso Not (d(start + a) = 0 AndAlso d(start + a + 1) = 0 AndAlso d(start + a + 2) = 1)
+                a += 1
+            End While
+            If a + 2 >= length OrElse a >= 8 Then a = 0
+            Return a
+        End Function
 
         ' smallest k with AuStart(k) >= off (n when none)
         Private Shared Function FirstAuAtOrAfter(s As PamfMuxStream, off As Long) As Integer
@@ -408,9 +533,23 @@ Namespace PamfMux
                           PesHeaderLength(True, p.HasDts, True, 0)
                 Else
                     cap = SectorSize - PackHeaderLen - PesHeaderLength(False, False, False, 0)
-                    Dim k As Integer = FirstAnchorAtOrAfter(s, pos)
+                    Dim k As Integer = If(SonyClock, FirstAuAtOrAfter(s, pos), FirstAnchorAtOrAfter(s, pos))
                     firstInPes = k
-                    If k < n AndAlso s.Anchor(k) < pos + Math.Min(CLng(cap), remBlock) AndAlso
+                    If SonyClock Then
+                        ' pamfmux: AU first byte starts in this block and at least 2 of its bytes fit after PTS/DTS header
+                        If k < n AndAlso s.AuStart(k) < blk.EndOffset Then
+                            Dim au As AccessUnit = s.Aus(k)
+                            Dim d As Long = au.Pts - _lastStampPts(si)
+                            Dim hasDts As Boolean = (au.Dts <> au.Pts)
+                            Dim capS As Integer = SectorSize - PackHeaderLen - PesHeaderLength(True, hasDts, False, 0)
+                            If d > SonyStampMinTicks AndAlso d <= SonyStampMaxTicks AndAlso s.AuStart(k) - pos < CLng(capS) - 1L Then
+                                p.HasPts = True
+                                p.HasDts = hasDts
+                                p.TsAu = k
+                                cap = capS
+                            End If
+                        End If
+                    ElseIf k < n AndAlso s.Anchor(k) < pos + Math.Min(CLng(cap), remBlock) AndAlso
                        s.Aus(k).Dts - _lastStampPts(si) >= StampIntervalTicks Then
                         Dim au As AccessUnit = s.Aus(k)
                         Dim hasDts As Boolean = (au.Dts <> au.Pts)
@@ -427,9 +566,19 @@ Namespace PamfMux
                 ' an AU far enough after the last stamp that would start further inside this pack opens the next PES instead
                 Dim lastStamp As Long = If(p.HasPts, s.Aus(p.TsAu).Pts, _lastStampPts(si))
                 Dim winEnd As Long = pos + Math.Min(CLng(cap), limit)
-                Dim j As Integer = FirstAnchorAtOrAfter(s, pos)
-                While j < n AndAlso s.Anchor(j) < winEnd
-                    If j <> firstInPes AndAlso j < n - 1 AndAlso s.Aus(j + 1).Dts - lastStamp >= CutIntervalTicks Then
+                Dim j As Integer = If(SonyClock, FirstAuAtOrAfter(s, pos), FirstAnchorAtOrAfter(s, pos))
+                While j < n AndAlso If(SonyClock, s.AuStart(j), s.Anchor(j)) < winEnd
+                    Dim cut As Boolean
+                    If j = firstInPes OrElse j >= n - 1 Then
+                        cut = False
+                    ElseIf SonyClock Then
+                        Dim dj As Long = s.Aus(j).Pts - lastStamp
+                        cut = dj > SonyStampMinTicks AndAlso dj <= SonyStampMaxTicks AndAlso
+                              s.Aus(j + 1).Pts - lastStamp > SonyCutTicks
+                    Else
+                        cut = s.Aus(j + 1).Dts - lastStamp >= CutIntervalTicks
+                    End If
+                    If cut Then
                         limit = Math.Max(1L, s.AuStart(j) - pos)
                         Exit While
                     End If
@@ -460,13 +609,13 @@ Namespace PamfMux
                     cap = capPts
                     payload = Math.Min(CLng(capPts), remaining)
                     Dim ptr As Integer = CInt(s.AuStart(k) - pos)
-                    p.Pointer = If(s.Codec = PamfStreamType.LPCM, &H4000 Or ptr, ptr)
+                    p.Pointer = If(s.Codec = PamfStreamType.LPCM, s.LpcmBitsField Or ptr, ptr)
                 Else
                     cap = capNo
                     Dim limit As Long = remaining
                     If k < s.Aus.Count Then limit = Math.Min(limit, s.AuStart(k) - pos)
                     payload = Math.Min(CLng(capNo), limit)
-                    p.Pointer = If(s.Codec = PamfStreamType.LPCM, &H47FF, &HFFFF)
+                    p.Pointer = If(s.Codec = PamfStreamType.LPCM, s.LpcmBitsField Or &H7FF, &HFFFF)
                 End If
                 Dim leftover As Integer = cap - CInt(payload)
                 If leftover >= MinPaddingPacket Then p.Padding = leftover Else p.Stuffing = leftover
@@ -501,6 +650,12 @@ Namespace PamfMux
             ReDim _needExt(n - 1)
             ReDim _cand(n - 1)
             ReDim _endAuPtr(n - 1)
+            _masterVideo = -1
+            For i As Integer = 0 To n - 1
+                If Streams(i).IsVideo AndAlso (_masterVideo < 0 OrElse Streams(i).PesStreamId < Streams(_masterVideo).PesStreamId) Then
+                    _masterVideo = i
+                End If
+            Next
             For i As Integer = 0 To n - 1
                 _needExt(i) = Streams(i).IsAudio
                 Streams(i).LateAus = 0
@@ -591,13 +746,16 @@ Namespace PamfMux
                 If p.Rap Then
                     s.Blocks(p.BlockIdx).StartPack = packIndex
                     _lastStampPts(si) = s.Aus(p.TsAu).Pts
-                    ' every audio stream repeats its P-STD extension after a video private_stream_2
-                    For i As Integer = 0 To Streams.Count - 1
-                        If Streams(i).IsAudio Then
-                            _needExt(i) = True
-                            _cand(i) = Nothing
-                        End If
-                    Next
+                    ' every audio stream repeats its P-STD extension after a private_stream_2 of the master video
+                    ' (pamfmux: the video stream with lowest stream_id)
+                    If si = _masterVideo Then
+                        For i As Integer = 0 To Streams.Count - 1
+                            If Streams(i).IsAudio Then
+                                _needExt(i) = True
+                                _cand(i) = Nothing
+                            End If
+                        Next
+                    End If
                 ElseIf p.HasPts Then
                     _lastStampPts(si) = s.Aus(p.TsAu).Pts
                     s.Stamps += 1
@@ -652,12 +810,18 @@ Namespace PamfMux
             Dim muxRateUnits As Integer = MuxRateBps \ 8 \ 50
             Dim buf As New MemoryStream(SectorSize)
             Dim auPtr(Streams.Count - 1) As Integer
+            ' system header video buffer bound: largest AVC P-STD + largest MPEG-2 P-STD (pamfmux)
+            Dim maxAvcKb As Integer = 0, maxM2vKb As Integer = 0
+            For Each x In Streams
+                If x.Codec = PamfStreamType.AVC Then maxAvcKb = Math.Max(maxAvcKb, x.PstdBufferSize)
+                If x.Codec = PamfStreamType.MPEG2Video Then maxM2vKb = Math.Max(maxM2vKb, x.PstdBufferSize)
+            Next
             For Each p In _plan
                 Dim s As PamfMuxStream = Streams(p.StreamIdx)
                 buf.SetLength(0)
                 WritePackHeader(buf, p.Scr27 \ 300L, CInt(p.Scr27 Mod 300L), muxRateUnits)
                 If p.Rap Then
-                    WriteSystemHeader(buf, muxRateUnits, s.PstdBufferSize)
+                    WriteSystemHeader(buf, muxRateUnits, maxAvcKb + maxM2vKb)
                     WritePs2(buf, s, s.Blocks(p.BlockIdx))
                 End If
                 Dim pts As Long = 0, dts As Long = 0
@@ -671,9 +835,9 @@ Namespace PamfMux
                 Else
                     WritePesHeader(buf, SC_PrivateStream1, AudioSubHeaderLen + p.Len, p.HasPts, pts, False, 0,
                                    p.HasPstd, s.PstdBufferSize, p.Stuffing)
-                    ' sub-header: sub_stream_id, config byte (LPCM 0x31 = 48 kHz stereo), first_au pointer
+                    ' sub-header: sub_stream_id, config byte (LPCM: channel assignment + 48 kHz, 0x31 = stereo), first_au pointer
                     WriteAudioSubHeader(buf, s.SubStreamId,
-                                        If(s.Codec = PamfStreamType.LPCM, CByte(&H31), CByte(0)),
+                                        If(s.Codec = PamfStreamType.LPCM, s.LpcmConfigByte, CByte(0)),
                                         CUShort(p.Pointer And &HFFFF))
                 End If
                 CopyPayload(buf, s, p.Pos, p.Len, auPtr(p.StreamIdx))
@@ -684,11 +848,11 @@ Namespace PamfMux
                 output.Write(buf.GetBuffer(), 0, SectorSize)
             Next
 
-            ' optional MPEG_program_end_code in its own sector
+            ' optional MPEG_program_end_code in its own sector, rest of sector = zero (as pamfmux writes it)
             If WriteEndSector Then
                 buf.SetLength(0)
                 WriteProgramEnd(buf)
-                WritePaddingStream(buf, SectorSize - 4)
+                buf.Write(New Byte(SectorSize - 5) {}, 0, SectorSize - 4)
                 output.Write(buf.GetBuffer(), 0, SectorSize)
             End If
         End Sub
@@ -704,11 +868,15 @@ Namespace PamfMux
             While left > 0
                 Dim au As AccessUnit = s.Aus(k)
                 Dim inAu As Integer = CInt(cur - s.AuStart(k))
-                Dim take As Integer = Math.Min(left, au.Data.Length - inAu)
-                out.Write(au.Data, inAu, take)
+                Dim take As Integer = Math.Min(left, au.Length - inAu)
+                If au.Data IsNot Nothing Then
+                    out.Write(au.Data, inAu, take)
+                Else
+                    au.Source.CopyTo(out, au, inAu, take)
+                End If
                 left -= take
                 cur += take
-                If inAu + take >= au.Data.Length Then k += 1
+                If inAu + take >= au.Length Then k += 1
             End While
         End Sub
 
@@ -720,8 +888,9 @@ Namespace PamfMux
         '   [10..13] 0
         '   [14..15] 4N + 2
         '   [16..17] N = pictures in the block
-        '   [18..]   N x 4 bytes, decode order:
-        '            AVC   : 00, ref << 7 | size bits 22..16, size bits 15..8, size bits 7..0
+        '   [18..]   N x 4 bytes, decode order (CAuInformation):
+        '            AVC   : picture structure (low nibble: 1 top field, 2 bottom field, 0 frame),
+        '                    ref << 7 | size bits 20..16, size bits 15..8, size bits 7..0 (21-bit size)
         '            MPEG-2: picture_coding_type << 5, 24 bit size
         Private Shared Sub WritePs2(out As Stream, s As PamfMuxStream, blk As VideoBlock)
             Dim n As Integer = blk.AuCount
@@ -745,15 +914,15 @@ Namespace PamfMux
             Dim isM2v As Boolean = (s.Codec = PamfStreamType.MPEG2Video)
             For k As Integer = blk.FirstAu To blk.FirstAu + n - 1
                 Dim au As AccessUnit = s.Aus(k)
-                Dim size As Integer = au.Data.Length
+                Dim size As Integer = au.Length
                 If isM2v Then
                     If size > &HFFFFFF Then size = &HFFFFFF
                     out.WriteByte(CByte((au.PictureCodingType And 7) << 5))
                     out.WriteByte(CByte((size >> 16) And &HFF))
                 Else
-                    If size > &H7FFFFF Then size = &H7FFFFF
-                    out.WriteByte(0)
-                    out.WriteByte(CByte(If(au.IsReferenceFrame, &H80, 0) Or ((size >> 16) And &H7F)))
+                    If size > MaxAvcPs2AuSize Then size = MaxAvcPs2AuSize
+                    out.WriteByte(If(au.IsField, au.PictureStructure, CByte(0)))
+                    out.WriteByte(CByte(If(au.IsReferenceFrame, &H80, 0) Or ((size >> 16) And &H1F)))
                 End If
                 out.WriteByte(CByte((size >> 8) And &HFF))
                 out.WriteByte(CByte(size And &HFF))

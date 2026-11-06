@@ -263,14 +263,14 @@ Namespace PamfMux
         Public Sub AddLpcmStream(channel As Byte, subStreamId As Byte,
                                  sampleRate As Integer,
                                  numChannels As Byte, bitsPerSample As Integer)
-            ' for LPCM the audio struct also carries a bit-depth code at ci(4).
-            ' Sony PAMF use a coded byte here, not the raw bit count:
-            '   0x40 = 16-bit  (observed in PS3 game PAMFs)
-            '   0x50 = 24-bit  (inferred from the bit-field shape)
+            ' bit-depth code at ci(4)
+            ' bits_per_sample << 6 (CELL_PAMF_BIT_LENGTH_16 = 1, _24 = 3):
+            '   0x40 = 16-bit
+            '   0xC0 = 24-bit
             Dim bpsCode As Byte
             Select Case bitsPerSample
                 Case 16 : bpsCode = &H40
-                Case 24 : bpsCode = &H50
+                Case 24 : bpsCode = &HC0
                 Case Else : bpsCode = CByte(bitsPerSample And &HFF)  ' fallback
             End Select
             Dim ci(31) As Byte
