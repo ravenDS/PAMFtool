@@ -52,9 +52,10 @@ Friend Module PamfMuxRunner
                    overrideMuxRateBps As Integer,
                    overrideStdDelayTicks As Integer,
                    overrideInitialScr As Long,
-                   endSector As Boolean)
+                   endSector As Boolean,
+                   sonyClock As Boolean)
         If positional.Count < 2 Then
-            Console.Error.WriteLine("Usage: PAMFtool -mux <inputDir> <output.pamf> [-noep] [-noatsc] [-deblock | -nodeblock] [-pstd <KB>] [-mmb <n>] [-ps2-block <N>] [-muxrate <kbps>] [-std-delay <ticks>] [-initial-scr <ticks>] [-endsector]")
+            Console.Error.WriteLine("Usage: PAMFtool -mux <inputDir> <output.pamf> [-noep] [-noatsc] [-deblock | -nodeblock] [-pstd <KB>] [-mmb <n>] [-ps2-block <N>] [-muxrate <kbps>] [-std-delay <ticks>] [-initial-scr <ticks>] [-endsector] [-sony-clock]")
             Environment.Exit(1)
         End If
         Dim inDir As String = positional(0)
@@ -84,6 +85,7 @@ Friend Module PamfMuxRunner
         If overrideMuxRateBps > 0 Then Console.WriteLine($"  -muxrate {overrideMuxRateBps \ 1000} kbps: pack_header mux_rate (Sony spec: 48000/24000/12000)")
         If overrideInitialScr >= 0 Then Console.WriteLine($"  -initial-scr {overrideInitialScr}: SCR origin override")
         If endSector Then Console.WriteLine("  -endsector: a program_end_code sector is appended after the last pack")
+        If sonyClock Then Console.WriteLine("  -pamfmux: SCR origin 0 and mid-block video timestamps as pamfmux does")
         If ps2MinPictures > 0 Then
             Console.WriteLine($"  -ps2-block {ps2MinPictures}: ps2/EP blocks start at random access points at least {ps2MinPictures} pictures apart")
         ElseIf ps2MinPictures = 0 Then
@@ -96,7 +98,7 @@ Friend Module PamfMuxRunner
         Console.WriteLine("Muxing to: " & outPath)
         BuildPamfFromFiles(files, outPath, noEp, forceDeblock, forceNoDeblock, noAtsc,
                            overridePstdKb, overrideMmb, ps2MinPictures, overrideMuxRateBps,
-                           overrideStdDelayTicks, overrideInitialScr, endSector)
+                           overrideStdDelayTicks, overrideInitialScr, endSector, sonyClock)
         Dim sz As Long = New FileInfo(outPath).Length
         Console.WriteLine("Wrote " & outPath & " (" & sz.ToString("N0") & " bytes)")
     End Sub
@@ -159,11 +161,12 @@ Friend Module PamfMuxRunner
                                    overrideMuxRateBps As Integer,
                                    overrideStdDelayTicks As Integer,
                                    overrideInitialScr As Long,
-                                   endSector As Boolean)
+                                   endSector As Boolean,
+                                   sonyClock As Boolean)
         Try
             BuildPamf(files, outPath, noEp, forceDeblock, forceNoDeblock, noAtsc,
                       overridePstdKb, overrideMmb, ps2MinPictures, overrideMuxRateBps,
-                      overrideStdDelayTicks, overrideInitialScr, endSector)
+                      overrideStdDelayTicks, overrideInitialScr, endSector, sonyClock)
         Finally
             For Each src In _sources
                 src.Dispose()
@@ -181,10 +184,12 @@ Friend Module PamfMuxRunner
                           overrideMuxRateBps As Integer,
                           overrideStdDelayTicks As Integer,
                           overrideInitialScr As Long,
-                          endSector As Boolean)
+                          endSector As Boolean,
+                          sonyClock As Boolean)
         Dim mux As New PamfMuxer()
         mux.SkipEpTable = noEp
         mux.PsMuxer.WriteEndSector = endSector
+        mux.PsMuxer.SonyClock = sonyClock
         _videoTimings.Clear()
         _firstVideoIsHighProfile = Nothing
         If overrideMuxRateBps > 0 Then mux.PsMuxer.MuxRateBps = overrideMuxRateBps
@@ -204,8 +209,9 @@ Friend Module PamfMuxRunner
         Next
 
         ' SCR origin: AVC High-profile files use 0, AVC Main and MPEG-2 files 30000 (SCR0 = origin + n slots)
-        ' -initial-scr keeps accepting the old pack-0 values: 30 -> origin 0, 30030 -> origin 30000
-        Dim origin As Long = If(_firstVideoIsHighProfile.GetValueOrDefault(False), 0L, 30000L)
+        ' -sony-clock: 0 for every stream type, as Sony's command-line muxer (its clock starts at 0)
+        ' -initial-scr keeps accepting the old pack-0 values: 30 -> origin 0, 30030 -> origin 30000, and wins over -sony-clock
+        Dim origin As Long = If(sonyClock OrElse _firstVideoIsHighProfile.GetValueOrDefault(False), 0L, 30000L)
         If overrideInitialScr >= 0 Then
             Select Case overrideInitialScr
                 Case 30L : origin = 0L
@@ -464,7 +470,8 @@ Friend Module PamfMuxRunner
                 .SourceLength = CInt(auSizes(i)),
                 .AnchorOffset = scan.Anchors(i),
                 .IsRandomAccessPoint = pic.IsRap,
-                .IsReferenceFrame = pic.IsReference
+                .IsReferenceFrame = pic.IsReference,
+                .PictureStructure = CByte(If(pic.FieldPic, If(pic.BottomField, 2, 1), 0))
             }
             SetVideoTimes(a, pic.DisplayUnits, pic.DecodeUnits, an.DelayUnits, rate)
             Dim starts As Boolean
@@ -753,14 +760,97 @@ Friend Module PamfMuxRunner
         Public RepeatFirstField As Boolean
         Public HasSequenceHeader As Boolean
         Public Units As Integer
-        Public DecodeUnits As Long
-        Public DisplayUnits As Long
     End Class
+
+    ' MPEG-2 decode / presentation times (times in quarter frames, frame = 4):
+    '   display time   : field 1/2 frame; frame 1, with repeat_first_field 1.5 (interlaced) or 2 / 3 (progressive_sequence, 3 with top_field_first)
+    '   decode step    : B picture its own display timen I/P picture the display time of previous I/P picture
+    '                    (interlaced I/P field: 1/2, or 1 when it follows the extra field of a repeat_first_field I/P frame)
+    '   PTS            : B = its DTS; I/P = DTS of the next I/P picture, once at least a frame's worth of fields came since the
+    '                    last one (so the two fields of an I/P pair are reordered together, the second at + the first's time)
+    Private Sub M2vSonyTiming(pics As List(Of M2vPicture), progressiveSeq As Boolean, dtsQ As Long(), ptsQ As Long())
+        Const D As Long = 4
+        Dim n As Integer = pics.Count
+        Dim dispQ(n - 1) As Long
+        Dim prevStruct As Integer = 0, prevTff As Boolean = False, prevRff As Boolean = False   ' last saved I/P picture
+        Dim lastFrame As Boolean = True
+        Dim fields As Integer = 0
+        Dim pend As New List(Of Integer)()
+        Dim t As Long = 0
+        For i As Integer = 0 To n - 1
+            Dim p As M2vPicture = pics(i)
+            Dim anchor As Boolean = (p.CodingType <> 3)
+            Dim fieldPic As Boolean = (p.PictureStructure = 1 OrElse p.PictureStructure = 2)
+            If anchor AndAlso fields > 1 Then
+                M2vReorder(pend, t, ptsQ, dispQ, pics)
+                pend.Clear()
+                fields = fields Mod 2
+            End If
+            Dim disp As Long
+            If progressiveSeq Then
+                disp = If(p.RepeatFirstField, If(p.TopFieldFirst, 3 * D, 2 * D), D)
+            ElseIf fieldPic Then
+                disp = D \ 2
+            Else
+                disp = If(p.RepeatFirstField, D * 3 \ 2, D)
+            End If
+            Dim inc As Long
+            If progressiveSeq Then
+                If anchor Then
+                    inc = If(prevRff, If(prevTff, 3 * D, 2 * D), D)
+                Else
+                    inc = If(p.RepeatFirstField, If(p.TopFieldFirst, 3 * D, 2 * D), D)
+                End If
+            ElseIf anchor Then
+                If fieldPic Then
+                    inc = If(Not lastFrame AndAlso prevStruct = 3 AndAlso prevRff, D, D \ 2)
+                Else
+                    inc = If(prevRff, D * 3 \ 2, D)
+                End If
+            Else
+                inc = If(fieldPic, D \ 2, If(p.RepeatFirstField, D * 3 \ 2, D))
+            End If
+            dtsQ(i) = t
+            ptsQ(i) = t
+            dispQ(i) = disp
+            t += inc
+            pend.Add(i)
+            If anchor AndAlso (p.PictureStructure <> 1 OrElse Not lastFrame) Then
+                prevStruct = If(fieldPic, p.PictureStructure, 3)
+                prevTff = p.TopFieldFirst
+                prevRff = p.RepeatFirstField
+            End If
+            If progressiveSeq Then
+                fields += 2
+                lastFrame = True
+            ElseIf Not fieldPic Then
+                fields += If(p.RepeatFirstField, 3, 2)
+                lastFrame = True
+            Else
+                fields += 1
+                lastFrame = False
+            End If
+        Next
+        M2vReorder(pend, t, ptsQ, dispQ, pics)
+    End Sub
+
+    ' I/P picture(s) at head of the pending list are shown at t (second field of a pair, right after the first)
+    Private Sub M2vReorder(pend As List(Of Integer), t As Long, ptsQ As Long(), dispQ As Long(), pics As List(Of M2vPicture))
+        If pend.Count >= 1 AndAlso pics(pend(0)).CodingType <> 3 Then ptsQ(pend(0)) = t
+        If pend.Count >= 2 AndAlso pics(pend(1)).CodingType <> 3 Then ptsQ(pend(1)) = t + dispQ(pend(0))
+    End Sub
+
+    ' quarter frames -> 90 kHz ticks, rounded down (exact fraction)
+    Private Function QuartersToTicks(q As Long, rate As FrameRate) As Long
+        Return FloorDiv(CDec(q) * 90000D * CDec(rate.Den), 4D * CDec(rate.Num))
+    End Function
 
     Private Sub RegisterAndQueueM2v(mux As PamfMuxer, f As MuxInput, overridePstdKb As Integer, ps2MinPictures As Integer)
         ' 1) peek at file head to parse the first sequence_header
-        Dim fi As New FileInfo(f.Path)
-        Dim fileLen As Long = fi.Length
+        Dim fileLen As Long
+        Using lfs As FileStream = File.OpenRead(f.Path)     ' length of file itself (FileInfo gives a symlink own size)
+            fileLen = lfs.Length
+        End Using
         Dim peekLen As Integer = CInt(Math.Min(CLng(1024 * 1024), fileLen))
         Dim peek(peekLen - 1) As Byte
         Using pfs As FileStream = File.OpenRead(f.Path)
@@ -905,11 +995,11 @@ Friend Module PamfMuxRunner
         End If
         If overridePstdKb > 0 Then ps.PstdBufferSize = overridePstdKb
 
-        ' display order: B pictures are shown as they are decoded,
-        ' an I/P picture (frame or field pair) when the next I/P arrives
-        ' positions in field units (frame = 2, + repeat_first_field)
+        ' picture timing as M2vSonyTiming, in quarter frames
+        ' PTS of first picture shown = 90000
+        ' field units (frame = 2, + repeat_first_field) give stream duration
         Dim nPic As Integer = pics.Count
-        Dim dec As Long = 0
+        Dim totalUnits As Long = 0
         For k As Integer = 0 To nPic - 1
             Dim p As M2vPicture = pics(k)
             If p.PictureStructure <> 3 AndAlso p.PictureStructure <> 0 Then
@@ -919,37 +1009,14 @@ Friend Module PamfMuxRunner
             Else
                 p.Units = 2 + If(p.RepeatFirstField, 1, 0)
             End If
-            p.DecodeUnits = dec
-            dec += p.Units
+            totalUnits += p.Units
         Next
-        Dim totalUnits As Long = dec
-        Dim dispOrder As New List(Of Integer)()
-        Dim pending As New List(Of Integer)()
-        Dim k2 As Integer = 0
-        While k2 < nPic
-            Dim group As New List(Of Integer) From {k2}
-            If pics(k2).PictureStructure <> 3 AndAlso pics(k2).PictureStructure <> 0 AndAlso k2 + 1 < nPic AndAlso
-               pics(k2 + 1).PictureStructure <> 3 AndAlso pics(k2 + 1).PictureStructure <> 0 AndAlso
-               pics(k2 + 1).PictureStructure <> pics(k2).PictureStructure Then
-                group.Add(k2 + 1)
-            End If
-            If pics(k2).CodingType = 3 Then
-                dispOrder.AddRange(group)
-            Else
-                dispOrder.AddRange(pending)
-                pending = group
-            End If
-            k2 += group.Count
-        End While
-        dispOrder.AddRange(pending)
-        Dim disp As Long = 0
-        For Each k In dispOrder
-            pics(k).DisplayUnits = disp
-            disp += pics(k).Units
-        Next
-        Dim delay As Long = 2
-        For Each p In pics
-            delay = Math.Max(delay, p.DecodeUnits - p.DisplayUnits)
+        Dim dtsQ(nPic - 1) As Long
+        Dim ptsQ(nPic - 1) As Long
+        M2vSonyTiming(pics, progressiveSeq, dtsQ, ptsQ)
+        Dim minPtsQ As Long = Long.MaxValue
+        For k As Integer = 0 To nPic - 1
+            minPtsQ = Math.Min(minPtsQ, ptsQ(k))
         Next
 
         ' 3) pass 2: queue each AU, bytes stay in file until packs are written
@@ -979,9 +1046,12 @@ Friend Module PamfMuxRunner
                 .AnchorOffset = If(i = 0, Mpeg2PsMuxer.VideoAnchorOffset(peek, 0, CInt(Math.Min(sz, CLng(peek.Length)))), 0),
                 .IsRandomAccessPoint = isRap,
                 .IsReferenceFrame = (p.CodingType = 1 OrElse p.CodingType = 2),
-                .PictureCodingType = CByte(p.CodingType And 7)
+                .PictureCodingType = CByte(p.CodingType And 7),
+                .PictureStructure = CByte(p.PictureStructure And 3)
             }
-            SetVideoTimes(a, p.DisplayUnits, p.DecodeUnits, delay, rate)
+            a.Pts = 90000L + QuartersToTicks(ptsQ(i) - minPtsQ, rate)
+            a.Dts = 90000L + QuartersToTicks(dtsQ(i) - minPtsQ, rate)
+            a.DecodeTime27 = a.Dts * 300L
             Dim starts As Boolean = (i = 0) OrElse (isRap AndAlso (ps2MinPictures <= 0 OrElse i - blockStartK >= ps2MinPictures))
             If starts Then
                 If blocks > 0 AndAlso a.DecodeTime27 - blockStartT27 > LongBlockTicks * 300L Then longBlocks += 1
@@ -994,7 +1064,7 @@ Friend Module PamfMuxRunner
         Next
         _videoTimings.Add(New VideoTiming() With {.Rate = rate, .TotalUnits = totalUnits,
                                                   .EndPts90 = 90000L + UnitsToTicks(totalUnits, rate, 90000L)})
-        Console.WriteLine($"  MPEG-2: {nPic:N0} pictures, {fps:F3} fps, DTS offset {delay / 2.0:0.#} frame(s), {blocks:N0} ps2 blocks")
+        Console.WriteLine($"  MPEG-2: {nPic:N0} pictures, {fps:F3} fps, DTS offset {(minPtsQ - dtsQ(0)) / 4.0:0.##} frame(s), {blocks:N0} ps2 blocks")
         If Not ((pics(0).CodingType = 1) AndAlso pics(0).HasSequenceHeader) Then
             Console.WriteLine("  [warn] the stream does not start with an I picture preceded by a sequence header")
         End If
@@ -1234,13 +1304,38 @@ Friend Module PamfMuxRunner
 
     Private Sub RegisterAndQueueAc3(mux As PamfMuxer, f As MuxInput)
         ' streamed: frame walk reads only around frame headers, frames are read when packs are written
+        ' an AU is one syncframe of the size its header gives (A/52 table)
+        ' bytes after the last frame or between frames are not muxed, only a truncated last frame keeps what is left of it
         Dim auStarts As New List(Of Long)()
+        Dim auSizes As New List(Of Integer)()
         Dim fileLen As Long
         Dim channels As Integer
         Dim resyncs As Integer = 0
         Using w As New FileWindow(f.Path)
             fileLen = w.Length
-            Dim firstSync As Long = FindAc3Sync(w, 0)
+            ' AC-3 with a 16-byte timecode header in front of every syncframe (the file starts with 0x01, each header too)
+            ' strip the headers, so AUs are the syncframes after them
+            Dim timecoded As Boolean = fileLen >= 21 AndAlso w.At(0) = &H1 AndAlso w.At(16) = &HB AndAlso w.At(17) = &H77
+            Dim firstSync As Long
+            If timecoded Then
+                Dim q As Long = 0
+                While q < fileLen AndAlso w.At(q) = &H1
+                    w.KeepFrom = q
+                    Dim fr As Long = q + 16
+                    Dim size As Integer = 0
+                    If fr + 5 <= fileLen AndAlso w.At(fr) = &HB AndAlso w.At(fr + 1) = &H77 Then size = Ac3FrameBytes(w.At(fr + 4))
+                    If size = 0 Then
+                        Throw New InvalidDataException($"AC-3 with timecode headers: no valid syncframe after the header at byte {q:N0} of {f.Path}")
+                    End If
+                    auStarts.Add(fr)
+                    auSizes.Add(CInt(Math.Min(CLng(size), fileLen - fr)))
+                    q = fr + size
+                End While
+                firstSync = auStarts(0)
+                Console.WriteLine($"  AC-3 with timecode headers: {auStarts.Count:N0} syncframes, the 16-byte headers are left out")
+            Else
+                firstSync = FindAc3Sync(w, 0)
+            End If
             If firstSync < 0 Then
                 Throw New InvalidDataException("No AC-3 sync word found in " & f.Path)
             End If
@@ -1255,14 +1350,15 @@ Friend Module PamfMuxRunner
             channels = chTable(acmod) + Ac3LfeOn(w, firstSync)
 
             ' walk frame by frame, resync on the next valid frame if a header is broken
-            Dim p As Long = firstSync
+            Dim p As Long = If(timecoded, -1L, firstSync)
             While p >= 0 AndAlso p + 5 <= fileLen
                 w.KeepFrom = p
                 Dim size As Integer = 0
                 If w.At(p) = &HB AndAlso w.At(p + 1) = &H77 Then size = Ac3FrameBytes(w.At(p + 4))
                 If size > 0 Then
                     auStarts.Add(p)
-                    p += size                       ' a truncated last frame keeps the remaining bytes
+                    auSizes.Add(CInt(Math.Min(CLng(size), fileLen - p)))   ' a truncated last frame keeps remaining bytes
+                    p += size
                 Else
                     p = FindAc3Sync(w, p + 1)
                     resyncs += 1
@@ -1282,11 +1378,9 @@ Friend Module PamfMuxRunner
         Dim src As New FilePayloadSource(f.Path)
         _sources.Add(src)
         For i As Integer = 0 To auStarts.Count - 1
-            Dim s As Long = auStarts(i)
-            Dim e As Long = If(i + 1 < auStarts.Count, auStarts(i + 1), fileLen)
             Dim pts As Long = ptsBase + CLng(i) * ptsStep
             mux.QueueAu(ps, New AccessUnit() With {
-                .Source = src, .SourceOffset = s, .SourceLength = CInt(e - s),
+                .Source = src, .SourceOffset = auStarts(i), .SourceLength = auSizes(i),
                 .Pts = pts, .Dts = pts, .DecodeTime27 = pts * 300L,
                 .IsRandomAccessPoint = False
             })

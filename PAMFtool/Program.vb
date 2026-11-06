@@ -37,6 +37,8 @@ Module Program
         Dim overrideInitialScr As Long = -1L
         ' -endsector : append a program_end_code sector after the last pack
         Dim endSector As Boolean = False
+        ' -pamfmux : SCR origin 0 and mid-block video timestamps as pamfmux
+        Dim sonyClock As Boolean = False
         Dim i As Integer = 0
         While i < args.Length
             Dim a As String = args(i)
@@ -49,6 +51,7 @@ Module Program
                 Case "-nodeblock", "--nodeblock", "/nodeblock" : forceNoDeblock = True
                 Case "-noatsc", "--noatsc", "/noatsc" : noAtsc = True
                 Case "-endsector", "--endsector", "/endsector" : endSector = True
+                Case "-pamfmux", "--pamfmux", "/pamfmux" : sonyClock = True
                 Case "-pace", "--pace", "/pace"
                     If i + 1 >= args.Length Then
                         Console.Error.WriteLine("Error: -pace requires a value in Mbps (e.g. -pace 7, or -pace auto, or -pace off).")
@@ -146,7 +149,7 @@ Module Program
             End If
             PamfMuxRunner.Run(positional, noEp, forceDeblock, forceNoDeblock, noAtsc, paceMbps,
                               overridePstdKb, overrideMmb, ps2FramesPerBlock, overrideMuxRateBps,
-                              overrideStdDelayTicks, overrideInitialScr, endSector)
+                              overrideStdDelayTicks, overrideInitialScr, endSector, sonyClock)
             Return
         End If
 
@@ -174,32 +177,37 @@ Module Program
         Console.WriteLine("Demux:  PAMFtool [-demux] <input.pamf> [outDir] [-info]")
         Console.WriteLine("Mux:    PAMFtool [-mux]   <inputDir>   [output.pamf] [-noep] [-noatsc]")
         Console.WriteLine("        [-deblock | -nodeblock] [-pstd <KB>] [-mmb <n>] [-ps2-block <N>]")
-        Console.WriteLine("        [-muxrate <kbps>] [-std-delay <ticks>] [-initial-scr <ticks>] [-endsector]")
+        Console.WriteLine("        [-muxrate <kbps>] [-std-delay <ticks>] [-initial-scr <ticks>] [-endsector] [-pamfmux]")
         Console.WriteLine()
         Console.WriteLine("Mux parameters:")
-        Console.WriteLine("  -noep            Skip writing the entry-point (EP) seek tables in the header.")
-        Console.WriteLine("  -noatsc          Ignore any 'atsc' RIFF chunk in .at3 inputs.")
-        Console.WriteLine("  -deblock         Force codec-info deblock flag to 1 (default: 1 if any slice uses the filter).")
-        Console.WriteLine("  -nodeblock       Force codec-info deblock flag to 0.")
-        Console.WriteLine("  -muxrate <kbps>  Pack mux_rate: 48000 (default), 24000 or 12000.")
+        Console.WriteLine("  -noep             Skip writing the entry-point (EP) seek tables in the header.")
+        Console.WriteLine("  -noatsc           Ignore any 'atsc' RIFF chunk in .at3 inputs.")
+        Console.WriteLine("  -deblock          Force codec-info deblock flag to 1 (default: 1 if any slice uses the filter).")
+        Console.WriteLine("  -nodeblock        Force codec-info deblock flag to 0.")
+        Console.WriteLine("  -muxrate <kbps>   Pack mux_rate: 48000 (default), 24000 or 12000.")
         Console.WriteLine()
-        Console.WriteLine("  -pstd <KB>       Force the video P-STD buffer size in KB (1..8191).")
+        Console.WriteLine("  -pstd <KB>        Force the video P-STD buffer size in KB (1..8191).")
         Console.WriteLine("                      Default: from the AVC HRD cpb_size / MPEG-2 vbv_buffer_size.")
         Console.WriteLine("                      (level table when the SPS has no HRD).")
         Console.WriteLine()
-        Console.WriteLine("  -mmb <n>         Override max_mean_bitrate byte in AVC codec_info (0..255; default: from the AU sizes).")
+        Console.WriteLine("  -mmb <n>          Override max_mean_bitrate byte in AVC codec_info (0..255; default: from the AU sizes).")
         Console.WriteLine("                      Usually 11 for 1080p L4.1 CABAC, 5 for 720p L3.1 CAVLC.")
         Console.WriteLine()
-        Console.WriteLine("  -ps2-block <N>   Minimum pictures between ps2/EP blocks (1..492). ")
+        Console.WriteLine("  -ps2-block <N>    Minimum pictures between ps2/EP blocks (1..255). ")
         Console.WriteLine("                      Default: 0.4 s (AVC), every GOP (MPEG-2).")
         Console.WriteLine()
-        Console.WriteLine("  -std-delay <tk>  std_delay_bound (u32 at header 0x66) and scheduler lead limit.")
+        Console.WriteLine("  -std-delay <tk>   std_delay_bound (u32 at header 0x66) and scheduler lead limit.")
         Console.WriteLine("                      Default: 90000 (1.00 s). Sony's muxer also offers 67500 (0.75 s) and 45000 (0.50 s).")
         Console.WriteLine()
         Console.WriteLine("  -initial-scr <tk> SCR origin: pack 0 SCR = origin + whole packs. ")
         Console.WriteLine("                      Default: 0 for AVC High profile, 30000 otherwise (30 / 30030 accepted as 0 / 30000).")
         Console.WriteLine()
-        Console.WriteLine("  -endsector       Append a 2048-byte sector with MPEG_program_end_code after the last pack")
+        Console.WriteLine("  -endsector        Append a 2048-byte sector with MPEG_program_end_code after the last pack")
+        Console.WriteLine("                      Default: off.")
+        Console.WriteLine()
+        Console.WriteLine("  -pamfmux          Mux as the official tool (pamfmux) does: ")
+        Console.WriteLine("                      SCR origin 0 for every stream type,")
+        Console.WriteLine("                      Mid-block video timestamps measured from PTS (0.51 .. 0.7 s after the last one)")
         Console.WriteLine("                      Default: off.")
         Console.WriteLine()
         Console.WriteLine("Additional parameters:")

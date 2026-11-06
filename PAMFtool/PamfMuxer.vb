@@ -136,9 +136,14 @@ Namespace PamfMux
             ' video buffer must at least hold largest AU plus two packs, or room rule can never let it in
             For Each s In PsMuxer.Streams
                 Dim maxAu As Long = 0
+                Dim bigAvc As Integer = 0
                 For Each au In s.Aus
                     If au.Length > maxAu Then maxAu = au.Length
+                    If au.Length > Mpeg2PsMuxer.MaxAvcPs2AuSize Then bigAvc += 1
                 Next
+                If s.Codec = PamfStreamType.AVC AndAlso bigAvc > 0 Then
+                    Console.WriteLine($"  [warn] s{s.Index:D2}: {bigAvc} AVC access unit(s) over {Mpeg2PsMuxer.MaxAvcPs2AuSize:N0} bytes; their ps2 size field is capped (Sony's muxer refuses such AUs)")
+                End If
                 Dim minKb As Integer = CInt((maxAu + 2L * Mpeg2PsPrimitives.SectorSize + 1023L) \ 1024L)
                 If s.PstdBufferSize < minKb Then
                     If minKb > Mpeg2PsMuxer.MaxPstdKb Then
