@@ -55,7 +55,7 @@ Friend Module PamfMuxRunner
                    endSector As Boolean,
                    sonyClock As Boolean)
         If positional.Count < 2 Then
-            Console.Error.WriteLine("Usage: PAMFtool -mux <inputDir> <output.pamf> [-noep] [-noatsc] [-deblock | -nodeblock] [-pstd <KB>] [-mmb <n>] [-ps2-block <N>] [-muxrate <kbps>] [-std-delay <ticks>] [-initial-scr <ticks>] [-endsector] [-sony-clock]")
+            Console.Error.WriteLine("Usage: PAMFtool -mux <inputDir> <output.pamf> [-noep] [-noatsc] [-deblock | -nodeblock] [-pstd <KB>] [-mmb <n>] [-ps2-block <N>] [-muxrate <kbps>] [-std-delay <ticks>] [-initial-scr <ticks>] [-endsector] [-pamfmux]")
             Environment.Exit(1)
         End If
         Dim inDir As String = positional(0)
@@ -209,8 +209,8 @@ Friend Module PamfMuxRunner
         Next
 
         ' SCR origin: AVC High-profile files use 0, AVC Main and MPEG-2 files 30000 (SCR0 = origin + n slots)
-        ' -sony-clock: 0 for every stream type, as Sony's command-line muxer (its clock starts at 0)
-        ' -initial-scr keeps accepting the old pack-0 values: 30 -> origin 0, 30030 -> origin 30000, and wins over -sony-clock
+        ' -pamfmux: 0 for every stream type, as Sony's command-line muxer (its clock starts at 0)
+        ' -initial-scr keeps accepting the old pack-0 values: 30 -> origin 0, 30030 -> origin 30000, and wins over -pamfmux
         Dim origin As Long = If(sonyClock OrElse _firstVideoIsHighProfile.GetValueOrDefault(False), 0L, 30000L)
         If overrideInitialScr >= 0 Then
             Select Case overrideInitialScr

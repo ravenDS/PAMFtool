@@ -51,7 +51,7 @@ Module Program
                 Case "-nodeblock", "--nodeblock", "/nodeblock" : forceNoDeblock = True
                 Case "-noatsc", "--noatsc", "/noatsc" : noAtsc = True
                 Case "-endsector", "--endsector", "/endsector" : endSector = True
-                Case "-pamfmux", "--pamfmux", "/pamfmux" : sonyClock = True
+                Case "-pamfmux", "--pamfmux", "/pamfmux", "-sony-clock" : sonyClock = True
                 Case "-pace", "--pace", "/pace"
                     If i + 1 >= args.Length Then
                         Console.Error.WriteLine("Error: -pace requires a value in Mbps (e.g. -pace 7, or -pace auto, or -pace off).")
