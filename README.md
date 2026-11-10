@@ -30,6 +30,7 @@ Supported streams:
 * `-muxrate <KBps>` - Override pack_header mux_rate (48000, 24000, or 12000)
 * `-std-delay <ticks>` - Override std_delay_bound and scheduler lead limit. See -h for values
 * `-initial-scr <ticks>` - SCR origin
+* `-pamfmux` - Mux like the latest official PAMF muxer (SCR origin 0 for every stream type)
 
 > [!TIP]
 > Mode is also auto-detected from the input file or folder.
